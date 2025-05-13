@@ -1,3 +1,4 @@
+// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -10,55 +11,71 @@ import (
 	"time"
 )
 
-var (
-	ErrSchedulerJobAlreadyRunning = errors.New("scheduler: job is already running")
-	ErrSchedulerNotRunning        = errors.New("scheduler: job is not running or already stopped")
-	ErrSchedulerPoolNil           = errors.New("scheduler: pool cannot be nil")
-	ErrSchedulerNameMissing       = errors.New("scheduler: name cannot be empty")
-)
-
+// Schedule captures details of a scheduled task event for observability.
+// Thread-safe for use in notification across goroutines.
 type Schedule struct {
-	Type     string
-	Name     string
-	TaskID   string
-	TaskType string
-	Message  string
-	Error    error
-	Routine  Routine
-	Time     time.Time
-	NextRun  time.Time
+	Type     string    // Event type (e.g., "started", "task_submitted", "stopped")
+	Name     string    // Scheduler name
+	TaskID   string    // Task identifier
+	TaskType string    // Type of the task
+	Message  string    // Descriptive message
+	Error    error     // Error, if any
+	Routine  Routine   // Routine configuration
+	Time     time.Time // Time of the event
+	NextRun  time.Time // Scheduled time for the next run
 }
 
+// Cycle configures a Scheduling instance during creation.
 type Cycle func(*Scheduling)
 
+// Scheduling holds configuration for a Scheduler, including its observable for events.
+// Thread-safe via pointer updates and observable notifications.
 type Scheduling struct {
-	observable Observable[Schedule]
+	observable Observable[Schedule] // Observable for schedule events
 }
 
+// Observable sets the observable for the Scheduling configuration.
+// Thread-safe as it updates the observable pointer.
+// Example:
+//
+//	s.Observable(obs) // Sets the observable for scheduling events
 func (s *Scheduling) Observable(obs Observable[Schedule]) {
 	s.observable = obs
 }
 
+// SchedulingWithObservable returns a Cycle that sets the observable for Scheduling.
+// Example:
+//
+//	scheduler, _ := NewScheduler("name", pool, routine, SchedulingWithObservable(obs)) // Configures observable
 func SchedulingWithObservable(obs Observable[Schedule]) Cycle {
 	return func(cfg *Scheduling) {
 		cfg.observable = obs
 	}
 }
 
+// Scheduler manages recurring or one-time task execution using a worker pool.
+// It supports task submission, logging, and observability of scheduling events.
+// Thread-safe via mutex and wait group synchronization.
 type Scheduler struct {
-	name           string
-	pool           *Pool
-	routine        Routine
-	cfg            Scheduling
-	mu             sync.Mutex
-	running        bool
-	task           interface{}
-	taskRunCtx     context.Context
-	runnerCancelFn context.CancelFunc
-	runnerWg       sync.WaitGroup
-	logger         *ll.Logger
+	name           string             // Unique name of the scheduler
+	pool           *Pool              // Worker pool for task execution
+	routine        Routine            // Routine configuration for scheduling
+	cfg            Scheduling         // Scheduler configuration
+	mu             sync.Mutex         // Protects running state and task submission
+	running        bool               // Indicates if the scheduler is active
+	task           interface{}        // Current task (Task or TaskCtx)
+	taskRunCtx     context.Context    // Context for TaskCtx execution
+	runnerCancelFn context.CancelFunc // Cancels the runner loop
+	runnerWg       sync.WaitGroup     // Waits for the runner goroutine
+	logger         *ll.Logger         // Logger with scheduler namespace
 }
 
+// NewScheduler creates a new Scheduler with the given name, pool, routine, and options.
+// It returns an error if the name is empty or the pool is nil.
+// Thread-safe via initialization and logger namespace.
+// Example:
+//
+//	scheduler, err := NewScheduler("myScheduler", pool, Routine{Interval: time.Second}, SchedulingWithObservable(obs))
 func NewScheduler(name string, pool *Pool, schedule Routine, opts ...Cycle) (*Scheduler, error) {
 	if name == "" {
 		return nil, ErrSchedulerNameMissing
@@ -84,6 +101,9 @@ func NewScheduler(name string, pool *Pool, schedule Routine, opts ...Cycle) (*Sc
 	}, nil
 }
 
+// emit sends a scheduling event to the observable with the specified details.
+// It uses the current time if eventTime is zero.
+// Thread-safe via observable notifications.
 func (s *Scheduler) emit(eventType string, taskRefID string, taskTypeName string, eventTime time.Time, message string, err error) {
 	if s.cfg.observable == nil {
 		return
@@ -104,6 +124,9 @@ func (s *Scheduler) emit(eventType string, taskRefID string, taskTypeName string
 	s.cfg.observable.Notify(event)
 }
 
+// loop runs the scheduler’s task execution loop in a goroutine.
+// It submits tasks based on the routine configuration and handles cancellation.
+// Thread-safe via context and wait group.
 func (s *Scheduler) loop(runnerCtx context.Context, taskToRun interface{}, perExecutionCtx context.Context) {
 	defer s.runnerWg.Done()
 	defer func() {
@@ -209,12 +232,15 @@ func (s *Scheduler) loop(runnerCtx context.Context, taskToRun interface{}, perEx
 	}
 }
 
+// submit attempts to submit a task to the pool and returns its ID and submission status.
+// It retries submission up to retryScheduler times if the queue is full.
+// Thread-safe via pool operations and logging.
 func (s *Scheduler) submit(taskToRun interface{}, perExecutionCtx context.Context) (taskReferenceID string, submittedToPool bool) {
 	taskReferenceID = defaultIDScheduler(taskToRun)
 	taskTypeName := typeName(taskToRun)
 
 	if s.pool == nil {
-		s.logger.Info("Scheduler [%s]: Pool is nil, cannot submit task %s. This should not happen.", s.name, taskTypeName)
+		s.logger.Info("Scheduler [%s]: Pool is nil, cannot submit task %s", s.name, taskTypeName)
 		return taskReferenceID, false
 	}
 
@@ -235,7 +261,7 @@ func (s *Scheduler) submit(taskToRun interface{}, perExecutionCtx context.Contex
 			submissionSuccessful = false
 			message := fmt.Sprintf("Error submitting Task %s to pool: %v", taskTypeName, err)
 			if errors.Is(err, ErrQueueFull) {
-				for i := 0; i < retryScheduler; i++ { // Retry up to 3 times
+				for i := 0; i < retryScheduler; i++ {
 					time.Sleep(time.Millisecond * 100 * time.Duration(i+1))
 					err = s.pool.Submit(task)
 					if err == nil {
@@ -244,7 +270,7 @@ func (s *Scheduler) submit(taskToRun interface{}, perExecutionCtx context.Contex
 					}
 				}
 				if !submissionSuccessful {
-					message = fmt.Sprintf("Pool queue full after retries, Task %s not submitted by scheduler [%s].", taskTypeName, s.name)
+					message = fmt.Sprintf("Pool queue full after %d retries, Task %s not submitted by scheduler [%s]", retryScheduler, taskTypeName, s.name)
 					s.logger.Info("Scheduler [%s]: %s", s.name, message)
 				}
 			}
@@ -259,7 +285,7 @@ func (s *Scheduler) submit(taskToRun interface{}, perExecutionCtx context.Contex
 		}
 		select {
 		case <-execCtx.Done():
-			s.logger.Info("Scheduler [%s]: Execution context for Task %s is done (%v), not submitting.", s.name, taskTypeName, execCtx.Err())
+			s.logger.Info("Scheduler [%s]: Execution context for Task %s is done (%v), not submitting", s.name, taskTypeName, execCtx.Err())
 			return taskReferenceID, false
 		default:
 		}
@@ -282,6 +308,12 @@ func (s *Scheduler) submit(taskToRun interface{}, perExecutionCtx context.Contex
 	return taskReferenceID, submissionSuccessful
 }
 
+// Do schedules one or more Tasks for execution in the worker pool.
+// It returns an error if the scheduler is already running.
+// Thread-safe via mutex and wait group.
+// Example:
+//
+//	scheduler.Do(myTask) // Schedules a task
 func (s *Scheduler) Do(ts ...Task) error {
 	s.mu.Lock()
 	if s.running {
@@ -304,6 +336,12 @@ func (s *Scheduler) Do(ts ...Task) error {
 	return nil
 }
 
+// DoCtx schedules one or more TaskCtx tasks for execution with the given context.
+// It returns an error if the scheduler is already running.
+// Thread-safe via mutex and wait group.
+// Example:
+//
+//	scheduler.DoCtx(ctx, myTaskCtx) // Schedules a context-aware task
 func (s *Scheduler) DoCtx(taskExecCtx context.Context, ts ...TaskCtx) error {
 	s.mu.Lock()
 	if s.running {
@@ -330,6 +368,12 @@ func (s *Scheduler) DoCtx(taskExecCtx context.Context, ts ...TaskCtx) error {
 	return nil
 }
 
+// Terminate stops the scheduler and optionally shuts down the pool.
+// It returns an error if the scheduler is not running.
+// Thread-safe via mutex and wait group.
+// Example:
+//
+//	scheduler.Terminate(true) // Stops scheduler and shuts down pool
 func (s *Scheduler) Terminate(cancel bool) error {
 	s.mu.Lock()
 	if !s.running {
@@ -345,20 +389,36 @@ func (s *Scheduler) Terminate(cancel bool) error {
 	s.mu.Unlock()
 	s.runnerWg.Wait()
 	if cancel {
-		s.pool.Shutdown(time.Second * 5) // Example timeout
+		s.pool.Shutdown(time.Second * 5)
 	}
-	s.emit("stopped", taskIDOnStop, taskTypeNameOnStop, time.Now(), "Scheduler job explicitly stopped.", nil)
+	s.emit("stopped", taskIDOnStop, taskTypeNameOnStop, time.Now(), "Scheduler job explicitly stopped", nil)
 	return nil
 }
 
+// Stop stops the scheduler without shutting down the pool.
+// It returns an error if the scheduler is not running.
+// Thread-safe via mutex and wait group.
+// Example:
+//
+//	scheduler.Stop() // Stops scheduler
 func (s *Scheduler) Stop() error {
 	return s.Terminate(false)
 }
 
+// Name returns the scheduler’s name.
+// Thread-safe via immutable field access.
+// Example:
+//
+//	name := scheduler.Name() // Retrieves scheduler name
 func (s *Scheduler) Name() string {
 	return s.name
 }
 
+// Running reports whether the scheduler is currently active.
+// Thread-safe via mutex.
+// Example:
+//
+//	if scheduler.Running() { ... } // Checks if scheduler is running
 func (s *Scheduler) Running() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

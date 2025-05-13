@@ -1,3 +1,4 @@
+// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -13,17 +14,23 @@ import (
 	"time"
 )
 
+// testSimpleTask is a test implementation of the Task interface for pool testing.
+// It supports configurable duration, failure, panic, and ID generation.
+// Thread-safe via atomic operations and channel signaling.
 type testSimpleTask struct {
-	id        string
-	data      string
-	duration  time.Duration
-	fail      bool
-	panicMsg  string
-	idFunc    func() string
-	wasRun    atomic.Bool
-	runSignal chan struct{}
+	id        string        // Task identifier
+	data      string        // Optional task data
+	duration  time.Duration // Execution duration
+	fail      bool          // Whether to return an error
+	panicMsg  string        // Panic message, if set
+	idFunc    func() string // Optional custom ID function
+	wasRun    atomic.Bool   // Tracks if task was executed
+	runSignal chan struct{} // Signals task execution
 }
 
+// Do executes the test task, simulating work with a sleep, optional error, or panic.
+// It signals execution via runSignal if set.
+// Thread-safe via atomic operations and channel signaling.
 func (t *testSimpleTask) Do() error {
 	t.wasRun.Store(true)
 	if t.runSignal != nil {
@@ -47,6 +54,7 @@ func (t *testSimpleTask) Do() error {
 	return nil
 }
 
+// ID returns the test task’s identifier, using idFunc if set.
 func (t *testSimpleTask) ID() string {
 	if t.idFunc != nil {
 		return t.idFunc()
@@ -54,19 +62,25 @@ func (t *testSimpleTask) ID() string {
 	return t.id
 }
 
+// testCtxTask is a test implementation of the TaskCtx interface for pool testing.
+// It supports configurable duration, failure, panic, and context tracking.
+// Thread-safe via atomic operations, mutex, and channel signaling.
 type testCtxTask struct {
-	id          string
-	data        string
-	duration    time.Duration
-	fail        bool
-	panicMsg    string
-	idFunc      func() string
-	wasRun      atomic.Bool
-	runSignal   chan struct{}
-	ctxReceived context.Context
-	muCtx       sync.Mutex
+	id          string          // Task identifier
+	data        string          // Optional task data
+	duration    time.Duration   // Execution duration
+	fail        bool            // Whether to return an error
+	panicMsg    string          // Panic message, if set
+	idFunc      func() string   // Optional custom ID function
+	wasRun      atomic.Bool     // Tracks if task was executed
+	runSignal   chan struct{}   // Signals task execution
+	ctxReceived context.Context // Stores received context
+	muCtx       sync.Mutex      // Protects ctxReceived
 }
 
+// Do executes the test task with the given context, simulating work with a sleep, optional error, or panic.
+// It signals execution via runSignal if set and respects context cancellation.
+// Thread-safe via atomic operations, mutex, and channel signaling.
 func (t *testCtxTask) Do(ctx context.Context) error {
 	t.muCtx.Lock()
 	t.ctxReceived = ctx
@@ -97,6 +111,7 @@ func (t *testCtxTask) Do(ctx context.Context) error {
 	}
 }
 
+// ID returns the test task’s identifier, using idFunc if set.
 func (t *testCtxTask) ID() string {
 	if t.idFunc != nil {
 		return t.idFunc()
@@ -104,27 +119,38 @@ func (t *testCtxTask) ID() string {
 	return t.id
 }
 
+// getReceivedContext returns the context received by the task during execution.
+// Thread-safe via mutex.
 func (t *testCtxTask) getReceivedContext() context.Context {
 	t.muCtx.Lock()
 	defer t.muCtx.Unlock()
 	return t.ctxReceived
 }
 
+// eventCollector is a test helper for collecting Observable events.
+// It stores events and provides methods to wait for or find specific events.
+// Thread-safe via mutex.
 type eventCollector struct {
-	mu     sync.Mutex
-	events []Event
+	mu     sync.Mutex // Protects events
+	events []Event    // Collected events
 }
 
+// newEventCollector creates a new event collector for test event observation.
+// Thread-safe via initialization.
 func newEventCollector() *eventCollector {
 	return &eventCollector{events: make([]Event, 0)}
 }
 
+// OnNotify appends a received event to the collector’s event list.
+// Thread-safe via mutex.
 func (ec *eventCollector) OnNotify(event Event) {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
 	ec.events = append(ec.events, event)
 }
 
+// getEvents returns a copy of all collected events.
+// Thread-safe via mutex.
 func (ec *eventCollector) getEvents() []Event {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
@@ -133,6 +159,8 @@ func (ec *eventCollector) getEvents() []Event {
 	return evtsCopy
 }
 
+// findEvents returns all events matching the specified taskID and type.
+// Thread-safe via mutex.
 func (ec *eventCollector) findEvents(taskID string, eventType string) []Event {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
@@ -147,6 +175,9 @@ func (ec *eventCollector) findEvents(taskID string, eventType string) []Event {
 	return found
 }
 
+// waitForEvent waits for an event with the specified taskID and type within the timeout.
+// It returns the event and a boolean indicating success.
+// Thread-safe via mutex.
 func (ec *eventCollector) waitForEvent(t *testing.T, taskID string, eventType string, timeout time.Duration) (Event, bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -160,6 +191,7 @@ func (ec *eventCollector) waitForEvent(t *testing.T, taskID string, eventType st
 	return Event{}, false
 }
 
+// TestPool_NewPool verifies that NewPool creates a non-nil Pool instance with the correct number of workers.
 func TestPool_NewPool(t *testing.T) {
 	p := NewPool(2, PoolingWithQueueSize(5))
 	if p == nil {
@@ -172,6 +204,8 @@ func TestPool_NewPool(t *testing.T) {
 	}
 }
 
+// TestPool_Submit_SimpleTask verifies that Pool executes a simple task correctly.
+// It checks task execution, event emission, and error handling.
 func TestPool_Submit_SimpleTask(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -219,6 +253,8 @@ func TestPool_Submit_SimpleTask(t *testing.T) {
 	}
 }
 
+// TestPool_Submit_TaskWithError verifies that Pool handles task errors correctly.
+// It checks for the expected error in the done event.
 func TestPool_Submit_TaskWithError(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -241,6 +277,8 @@ func TestPool_Submit_TaskWithError(t *testing.T) {
 	}
 }
 
+// TestPool_Submit_TaskWithPanic verifies that Pool handles task panics correctly.
+// It checks for a CaughtPanic error in the done event.
 func TestPool_Submit_TaskWithPanic(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -268,6 +306,8 @@ func TestPool_Submit_TaskWithPanic(t *testing.T) {
 	}
 }
 
+// TestPool_SubmitCtx_Simple verifies that Pool executes a context-aware task correctly.
+// It checks task execution, event emission, and context passing.
 func TestPool_SubmitCtx_Simple(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -298,6 +338,8 @@ func TestPool_SubmitCtx_Simple(t *testing.T) {
 	}
 }
 
+// TestPool_SubmitCtx_CancellationBeforeExecution verifies that Pool respects context cancellation before task execution.
+// It ensures cancelled tasks are not executed.
 func TestPool_SubmitCtx_CancellationBeforeExecution(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -354,6 +396,8 @@ func TestPool_SubmitCtx_CancellationBeforeExecution(t *testing.T) {
 	}
 }
 
+// TestPool_SubmitCtx_TaskRespectsCancellation verifies that Pool tasks respect context cancellation during execution.
+// It checks for DeadlineExceeded errors on timeout.
 func TestPool_SubmitCtx_TaskRespectsCancellation(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -386,6 +430,8 @@ func TestPool_SubmitCtx_TaskRespectsCancellation(t *testing.T) {
 	}
 }
 
+// TestPool_Submit_ErrQueueFull verifies that Pool returns ErrQueueFull when the task queue is full.
+// It ensures queue capacity limits are enforced.
 func TestPool_Submit_ErrQueueFull(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(0))
 	defer pool.Shutdown(1 * time.Second)
@@ -421,6 +467,8 @@ func TestPool_Submit_ErrQueueFull(t *testing.T) {
 	}
 }
 
+// TestPool_Shutdown verifies that Pool shuts down correctly and rejects new tasks.
+// It checks that all queued tasks run and post-shutdown submissions fail.
 func TestPool_Shutdown(t *testing.T) {
 	collector := newEventCollector()
 	obs := NewObservable[Event]()
@@ -462,6 +510,8 @@ func TestPool_Shutdown(t *testing.T) {
 	}
 }
 
+// TestPool_Shutdown_Timeout verifies that Pool returns ErrShutdownTimedOut for long-running tasks.
+// It ensures timeout behavior during shutdown.
 func TestPool_Shutdown_Timeout(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(1))
 
@@ -490,6 +540,8 @@ func TestPool_Shutdown_Timeout(t *testing.T) {
 	}
 }
 
+// TestPool_TaskIDGeneration verifies that Pool generates correct task IDs.
+// It tests default, custom, and Identifiable-based ID generation.
 func TestPool_TaskIDGeneration(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -533,6 +585,8 @@ func TestPool_TaskIDGeneration(t *testing.T) {
 	}
 }
 
+// TestPool_ZeroWorkers verifies that NewPool defaults to one worker when zero is specified.
+// It ensures tasks can still be executed.
 func TestPool_ZeroWorkers(t *testing.T) {
 	pool := NewPool(0)
 	defer pool.Shutdown(1 * time.Second)
@@ -551,6 +605,8 @@ func TestPool_ZeroWorkers(t *testing.T) {
 	}
 }
 
+// TestPool_ConcurrentSubmissions verifies that Pool handles concurrent task submissions.
+// It checks that tasks are executed and events are emitted correctly under load.
 func TestPool_ConcurrentSubmissions(t *testing.T) {
 	numTasks := 100
 	numWorkers := 10

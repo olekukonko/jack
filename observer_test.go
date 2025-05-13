@@ -1,3 +1,4 @@
+// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -7,21 +8,27 @@ import (
 	"time"
 )
 
-// mockObserver for testing
+// mockObserver is a test implementation of the Observer interface for testing Observable behavior.
+// It tracks notifications, supports custom logic, and can simulate panics.
+// Thread-safe via mutex.
 type mockObserver[T any] struct {
-	id         string
-	mu         sync.Mutex
-	notifCount int
-	lastValue  T
-	values     []T
-	onNotifyFn func(value T) // Optional custom logic
-	panicOn    int           // If > 0, panics on this notification number
+	id         string        // Observer identifier
+	mu         sync.Mutex    // Protects fields
+	notifCount int           // Number of notifications received
+	lastValue  T             // Last received value
+	values     []T           // All received values
+	onNotifyFn func(value T) // Optional custom notification logic
+	panicOn    int           // Panics on this notification number if set
 }
 
+// newMockObserver creates a new mock observer with the specified ID.
+// Thread-safe via initialization.
 func newMockObserver[T any](id string) *mockObserver[T] {
 	return &mockObserver[T]{id: id, values: make([]T, 0)}
 }
 
+// OnNotify processes a notification, updating counts and values, and optionally triggering a panic or custom logic.
+// Thread-safe via mutex.
 func (m *mockObserver[T]) OnNotify(value T) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -39,12 +46,16 @@ func (m *mockObserver[T]) OnNotify(value T) {
 	}
 }
 
+// getNotifCount returns the number of notifications received.
+// Thread-safe via mutex.
 func (m *mockObserver[T]) getNotifCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.notifCount
 }
 
+// getLastValue returns the last received value and a boolean indicating if a value was received.
+// Thread-safe via mutex.
 func (m *mockObserver[T]) getLastValue() (T, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -55,6 +66,8 @@ func (m *mockObserver[T]) getLastValue() (T, bool) {
 	return m.lastValue, true
 }
 
+// getAllValues returns a copy of all received values.
+// Thread-safe via mutex.
 func (m *mockObserver[T]) getAllValues() []T {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -64,6 +77,8 @@ func (m *mockObserver[T]) getAllValues() []T {
 	return valsCopy
 }
 
+// TestEventObservable_Basic verifies that Observable correctly notifies multiple observers.
+// It checks that all observers receive the expected number of notifications.
 func TestEventObservable_Basic(t *testing.T) {
 	obsable := NewObservable[string](1) // 1 worker for predictable testing if needed, though Notify is async
 	defer obsable.Shutdown()
@@ -97,6 +112,8 @@ func TestEventObservable_Basic(t *testing.T) {
 	}
 }
 
+// TestEventObservable_Remove verifies that removing an observer stops its notifications.
+// It checks that removed observers no longer receive events while others continue.
 func TestEventObservable_Remove(t *testing.T) {
 	obsable := NewObservable[int](1)
 	defer obsable.Shutdown()
@@ -126,6 +143,8 @@ func TestEventObservable_Remove(t *testing.T) {
 	}
 }
 
+// TestEventObservable_RemoveNonExistent verifies that removing a non-existent observer is safe.
+// It ensures no panics or errors occur and existing observers continue receiving notifications.
 func TestEventObservable_RemoveNonExistent(t *testing.T) {
 	obsable := NewObservable[int](1)
 	defer obsable.Shutdown()
@@ -142,12 +161,16 @@ func TestEventObservable_RemoveNonExistent(t *testing.T) {
 	}
 }
 
+// TestEventObservable_NotifyEmpty verifies that notifying with no observers is safe.
+// It ensures the Observable does not panic when no observers are registered.
 func TestEventObservable_NotifyEmpty(t *testing.T) {
 	obsable := NewObservable[string](1)
 	defer obsable.Shutdown()
 	obsable.Notify("test") // Should not panic
 }
 
+// TestEventObservable_ObserverPanic verifies that an observer panic does not crash the Observable.
+// It ensures other observers continue receiving notifications.
 func TestEventObservable_ObserverPanic(t *testing.T) {
 	// Note: Go's testing package can sometimes catch panics from goroutines
 	// and report them. This test primarily ensures the observable itself doesn't crash.
@@ -179,6 +202,8 @@ func TestEventObservable_ObserverPanic(t *testing.T) {
 	}
 }
 
+// TestEventObservable_ConcurrentAddRemoveNotify verifies concurrent safety of Observable operations.
+// It exercises adding, removing, and notifying observers concurrently to ensure no deadlocks or panics.
 func TestEventObservable_ConcurrentAddRemoveNotify(t *testing.T) {
 	obsable := NewObservable[int](2) // Use a few workers
 	defer obsable.Shutdown()
@@ -220,6 +245,8 @@ func TestEventObservable_ConcurrentAddRemoveNotify(t *testing.T) {
 	t.Log("ConcurrentAddRemoveNotify finished without deadlocks or panics.")
 }
 
+// TestEventObservable_Shutdown verifies that Observable shuts down correctly.
+// It ensures notifications before shutdown are delivered and post-shutdown notifications are dropped safely.
 func TestEventObservable_Shutdown(t *testing.T) {
 	obsable := NewObservable[string](2)
 	obs1 := newMockObserver[string]("obs1")
@@ -243,6 +270,8 @@ func TestEventObservable_Shutdown(t *testing.T) {
 	obsable.Shutdown()
 }
 
+// TestEventObservable_AddObserverDuringNotification verifies that adding an observer during a notification is safe.
+// It ensures snapshotting prevents deadlocks and new observers receive only subsequent events.
 func TestEventObservable_AddObserverDuringNotification(t *testing.T) {
 	// This tests if adding an observer from within another observer's OnNotify
 	// doesn't cause a deadlock, thanks to the snapshotting of observers.
@@ -289,7 +318,8 @@ func TestEventObservable_AddObserverDuringNotification(t *testing.T) {
 }
 
 // waitTimeout waits for the waitgroup for the specified duration.
-// Returns true if waiting timed out.
+// It returns true if waiting timed out.
+// Thread-safe via channel operations.
 func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 	c := make(chan struct{})
 	go func() {

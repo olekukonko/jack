@@ -1,3 +1,4 @@
+// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -6,84 +7,46 @@ import (
 	"github.com/olekukonko/ll"
 	"sync"
 	"time"
-	// Assuming 'logger' is a global or package-level variable like in pool.go
-	// For self-contained compilation, we might need a stub if it's not provided.
-	// var logger *ll.Logger // Example, assuming it's initialized elsewhere.
 )
 
-//// === tasker implementation (adapted from pool.go) ===
-//type tasker struct {
-//	task            interface{} // Either Task or TaskCtx
-//	ctx             context.Context
-//	taskIDGenerator func(interface{}) string
-//	defaultIDPrefix string
-//	// id              string // Removed, ID is generated on-the-fly or cached by Identifiable/generator
-//	// idOnce          sync.Once // Removed
-//}
-
-//func (tj *tasker) Run(_ context.Context) error { // Runner's process loop calls job.Run(context.Background())
-//	if taskCtx, ok := tj.task.(TaskCtx); ok {
-//		return taskCtx.Do(tj.ctx) // TaskCtx runs with its original context (tj.ctx)
-//	}
-//	if task, ok := tj.task.(Task); ok {
-//		return task.Do() // Task runs
-//	}
-//	return errors.New("invalid task type for Run")
-//}
-//
-//func (tj *tasker) ID() string {
-//	// 1. If task itself is Identifiable and provides a non-empty ID
-//	if identifiable, ok := tj.task.(Identifiable); ok {
-//		if id := identifiable.ID(); id != "" {
-//			return id
-//		}
-//	}
-//	// 2. Use taskIDGenerator if provided and returns non-empty
-//	//    (This handles custom ID generation and specific default for Runner tasks without explicit ID)
-//	if tj.taskIDGenerator != nil {
-//		if id := tj.taskIDGenerator(tj.task); id != "" {
-//			return id
-//		}
-//	}
-//	// 3. Fallback to defaultIDPrefix + ULID
-//	if tj.task == nil { // Should not happen with current Do/DoCtx checks
-//		return strings.Join([]string{tj.defaultIDPrefix, "nil_task", ulid.Make().String()}, ".")
-//	}
-//	return strings.Join([]string{tj.defaultIDPrefix, ulid.Make().String()}, ".")
-//}
-//
-//func (tj *tasker) Context() context.Context {
-//	if tj.ctx == nil { // Should be set by Do/DoCtx
-//		return context.Background()
-//	}
-//	return tj.ctx
-//}
-
-// === Runner implementation ===
+// Runner executes tasks asynchronously using a buffered task queue.
+// It supports observability and logging, processing tasks in a single goroutine.
+// Thread-safe via mutex, wait group, and channel operations.
 type Runner struct {
-	tasks      chan job
-	quitOnce   sync.Once
-	shutdownWg sync.WaitGroup
-	opts       runnerOptions
-	mu         sync.RWMutex
-	closed     bool
-	logger     *ll.Logger
+	tasks      chan job       // Channel for task submission
+	quitOnce   sync.Once      // Ensures shutdown is called once
+	shutdownWg sync.WaitGroup // Waits for process goroutine
+	opts       runnerOptions  // Configuration options
+	mu         sync.RWMutex   // Protects closed state
+	closed     bool           // Indicates if runner is closed
+	logger     *ll.Logger     // Logger with runner namespace
 }
 
+// runnerOptions holds configuration for a Runner.
 type runnerOptions struct {
-	queueSize       int
-	observable      Observable[Event]
-	taskIDGenerator func(interface{}) string
+	queueSize       int                      // Size of the task queue
+	observable      Observable[Event]        // Observable for task events
+	taskIDGenerator func(interface{}) string // Optional task ID generator
 }
 
+// RunnerOption configures a Runner during creation.
 type RunnerOption func(*runnerOptions)
 
+// WithRunnerObservable sets the observable for task events.
+// Example:
+//
+//	runner := NewRunner(WithRunnerObservable(obs)) // Configures observable
 func WithRunnerObservable(obs Observable[Event]) RunnerOption {
 	return func(opts *runnerOptions) {
 		opts.observable = obs
 	}
 }
 
+// WithRunnerQueueSize sets the task queue size.
+// Non-positive values are ignored.
+// Example:
+//
+//	runner := NewRunner(WithRunnerQueueSize(20)) // Sets queue size to 20
 func WithRunnerQueueSize(size int) RunnerOption {
 	return func(opts *runnerOptions) {
 		if size >= 0 {
@@ -92,16 +55,26 @@ func WithRunnerQueueSize(size int) RunnerOption {
 	}
 }
 
+// WithRunnerIDGenerator sets the task ID generator function.
+// Example:
+//
+//	runner := NewRunner(WithRunnerIDGenerator(customIDFunc)) // Sets custom ID generator
 func WithRunnerIDGenerator(fn func(interface{}) string) RunnerOption {
 	return func(opts *runnerOptions) {
 		opts.taskIDGenerator = fn
 	}
 }
 
+// NewRunner creates a new Runner with the specified options.
+// It initializes a task queue and starts a processing goroutine.
+// Thread-safe via initialization and logger namespace.
+// Example:
+//
+//	runner := NewRunner(WithRunnerQueueSize(10), WithRunnerObservable(obs)) // Creates runner with queue size 10
 func NewRunner(opts ...RunnerOption) *Runner {
 	options := runnerOptions{
 		queueSize:       10,
-		taskIDGenerator: defaultIDRunner, // Use the Runner-specific default
+		taskIDGenerator: defaultIDRunner,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -112,34 +85,32 @@ func NewRunner(opts ...RunnerOption) *Runner {
 		opts:  options,
 	}
 
-	r.shutdownWg.Add(1) // For the process goroutine
+	r.shutdownWg.Add(1)
 	go r.process()
 
-	if logger != nil { // Assuming global 'logger'
+	if logger != nil {
 		r.logger = logger.Namespace("runner")
 	} else {
-		r.logger = &ll.Logger{} // Fallback
+		r.logger = &ll.Logger{}
 	}
 	return r
 }
 
+// submit sends a job to the task queue, respecting the submission context.
+// It returns an error if the runner is closed, the queue is full, or the context is done.
+// Thread-safe via mutex and channel operations.
 func (r *Runner) submit(submitCtx context.Context, job job) error {
 	if job == nil {
-		if r.logger != nil {
-			r.logger.Info("nil job rejected")
-		}
+		r.logger.Info("nil job rejected")
 		return errors.New("nil job")
 	}
 
-	// Eagerly get TaskID for logging and events, as job.ID() could have logic.
 	taskID := job.ID()
 
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
-		if r.logger != nil {
-			r.logger.Info("rejected job %s: runner closed", taskID)
-		}
+		r.logger.Info("rejected job %s: runner closed", taskID)
 		if submitCtx != nil {
 			select {
 			case <-submitCtx.Done():
@@ -151,64 +122,62 @@ func (r *Runner) submit(submitCtx context.Context, job job) error {
 	}
 	r.mu.RUnlock()
 
-	if r.logger != nil {
-		r.logger.Debug("attempting to submit job %s (queue len %d)", taskID, len(r.tasks))
-	}
+	r.logger.Debug("attempting to submit job %s (queue len %d)", taskID, len(r.tasks))
 
-	if submitCtx != nil { // Path for DoCtx (blocking with context)
+	if submitCtx != nil {
 		select {
 		case r.tasks <- job:
-			// Successfully submitted
-			if r.opts.observable != nil { // Emit "queued" event
+			if r.opts.observable != nil {
 				r.opts.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 			}
-			if r.logger != nil {
-				r.logger.Debug("submitted job %s with context", taskID)
-			}
+			r.logger.Debug("submitted job %s with context", taskID)
 			return nil
 		case <-submitCtx.Done():
 			return submitCtx.Err()
 		}
-	} else { // Path for Do (non-blocking)
+	} else {
 		select {
 		case r.tasks <- job:
-			// Successfully submitted
-			if r.opts.observable != nil { // Emit "queued" event
+			if r.opts.observable != nil {
 				r.opts.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 			}
-			if r.logger != nil {
-				r.logger.Debug("submitted job %s", taskID)
-			}
+			r.logger.Debug("submitted job %s", taskID)
 			return nil
 		default:
-			// Queue is full
-			if r.logger != nil {
-				r.logger.Info("rejected job %s: queue full", taskID)
-			}
+			r.logger.Info("rejected job %s: queue full", taskID)
 			return ErrQueueFull
 		}
 	}
 }
 
+// Do submits a Task for execution in the runner’s queue.
+// It returns an error if the task is nil or the runner is closed.
+// Thread-safe via submit and channel operations.
+// Example:
+//
+//	runner.Do(myTask) // Submits a task
 func (r *Runner) Do(t Task) error {
 	if t == nil {
-		if r.logger != nil {
-			r.logger.Info("Runner.Do: received nil task")
-		}
+		r.logger.Info("Runner.Do: received nil task")
 		return errors.New("nil task")
 	}
 	job := &tasker{
 		task:            t,
-		ctx:             context.Background(), // Tasks via Do get a background context for their tasker
+		ctx:             context.Background(),
 		taskIDGenerator: r.opts.taskIDGenerator,
-		defaultIDPrefix: "runner", // Used by tasker.ID if no other ID source
+		defaultIDPrefix: "runner",
 	}
-	return r.submit(nil, job) // Pass nil context for non-blocking submit
+	return r.submit(nil, job)
 }
 
+// DoCtx submits a TaskCtx for execution with the given context.
+// It returns an error if the context or task is nil, the context is done, or the runner is closed.
+// Thread-safe via submit and channel operations.
+// Example:
+//
+//	runner.DoCtx(ctx, myTaskCtx) // Submits a context-aware task
 func (r *Runner) DoCtx(ctx context.Context, t TaskCtx) error {
 	if ctx == nil {
-		// It's generally better to return an error or default, rather than panic on nil context.Done()
 		return errors.New("DoCtx requires a non-nil context")
 	}
 	select {
@@ -218,30 +187,29 @@ func (r *Runner) DoCtx(ctx context.Context, t TaskCtx) error {
 	}
 	job := &tasker{
 		task:            t,
-		ctx:             ctx, // Tasks via DoCtx get the user-provided context for their tasker
+		ctx:             ctx,
 		taskIDGenerator: r.opts.taskIDGenerator,
 		defaultIDPrefix: "runner",
 	}
-	return r.submit(ctx, job) // Pass the context for blocking submit
+	return r.submit(ctx, job)
 }
 
+// process runs the runner’s task processing loop in a goroutine.
+// It executes tasks from the queue and emits observability events.
+// Thread-safe via channel operations and wait group.
 func (r *Runner) process() {
 	defer r.shutdownWg.Done()
-	runnerWorkerID := "runner-0" // Runner has a single conceptual worker for its process loop
+	runnerWorkerID := "runner-0"
 	for job := range r.tasks {
 		if job == nil {
-			if r.logger != nil {
-				r.logger.Info("Runner received nil job, skipping")
-			}
+			r.logger.Info("Runner received nil job, skipping")
 			continue
 		}
 
-		taskID := job.ID() // Get ID once
-		if r.logger != nil {
-			r.logger.Info("Runner processing job: type=%T, taskID=%s", job, taskID)
-		}
+		taskID := job.ID()
+		r.logger.Info("Runner processing job: type=%T, taskID=%s", job, taskID)
 
-		originalCtx := job.Context() // This is the context associated with the tasker (e.g., from DoCtx)
+		originalCtx := job.Context()
 
 		if r.opts.observable != nil {
 			r.opts.observable.Notify(Event{Type: "run", WorkerID: runnerWorkerID, TaskID: taskID, Time: time.Now()})
@@ -254,24 +222,18 @@ func (r *Runner) process() {
 		go func() {
 			defer func() {
 				if rec := recover(); rec != nil {
-					// For a real implementation, use runtime.Stack to get stack trace.
 					err = &CaughtPanic{Val: rec, Stack: []byte("stack trace unavailable in simplified example")}
-					if r.logger != nil {
-						r.logger.Info("PANIC in runner task execution (TaskID %s): %v", taskID, rec)
-					}
+					r.logger.Info("PANIC in runner task execution (TaskID %s): %v", taskID, rec)
 				}
 				close(executeDone)
 			}()
-			// job.Run itself will use job.Context() if it's a TaskCtx, or ignore context if it's Task.
-			// The context.Background() passed here is ignored by the current tasker.Run.
 			err = job.Run(context.Background())
 		}()
 
 		select {
 		case <-executeDone:
-			// err is set (or nil) by the goroutine
-		case <-originalCtx.Done(): // If the task's own context (from DoCtx) is cancelled
-			if err == nil { // Prioritize task's own error
+		case <-originalCtx.Done():
+			if err == nil {
 				err = originalCtx.Err()
 			}
 		}
@@ -289,6 +251,12 @@ func (r *Runner) process() {
 	}
 }
 
+// Shutdown closes the task queue and waits for the processing goroutine to finish.
+// It returns an error if the shutdown times out.
+// Thread-safe via mutex, once, and wait group.
+// Example:
+//
+//	runner.Shutdown(5 * time.Second) // Shuts down runner with 5-second timeout
 func (r *Runner) Shutdown(timeout time.Duration) error {
 	r.mu.Lock()
 	if r.closed {
@@ -316,6 +284,11 @@ func (r *Runner) Shutdown(timeout time.Duration) error {
 	}
 }
 
+// QueueSize returns the current number of tasks in the queue.
+// Thread-safe via channel length access.
+// Example:
+//
+//	size := runner.QueueSize() // Gets current queue size
 func (r *Runner) QueueSize() int {
 	return len(r.tasks)
 }

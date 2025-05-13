@@ -1,3 +1,4 @@
+// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -8,13 +9,18 @@ import (
 	"time"
 )
 
+// TestTask is a test implementation of the Task interface for scheduler testing.
+// It tracks execution count and supports optional failure.
+// Thread-safe via mutex.
 type TestTask struct {
-	mu         sync.Mutex
-	runCount   int
-	shouldFail bool
-	id         string
+	mu         sync.Mutex // Protects runCount
+	runCount   int        // Number of times Do is called
+	shouldFail bool       // Whether to return an error
+	id         string     // Task identifier
 }
 
+// Do executes the test task, incrementing the run count and returning an error if shouldFail is true.
+// Thread-safe via mutex.
 func (t *TestTask) Do() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -25,17 +31,23 @@ func (t *TestTask) Do() error {
 	return nil
 }
 
+// ID returns the test task’s identifier.
 func (t *TestTask) ID() string {
 	return t.id
 }
 
+// TestTaskCtx is a test implementation of the TaskCtx interface for scheduler testing.
+// It tracks execution count and supports optional failure with context awareness.
+// Thread-safe via mutex.
 type TestTaskCtx struct {
-	mu         sync.Mutex
-	runCount   int
-	shouldFail bool
-	id         string
+	mu         sync.Mutex // Protects runCount
+	runCount   int        // Number of times Do is called
+	shouldFail bool       // Whether to return an error
+	id         string     // Task identifier
 }
 
+// Do executes the test task with the given context, incrementing the run count and returning an error if shouldFail is true.
+// Thread-safe via mutex.
 func (t *TestTaskCtx) Do(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -46,10 +58,13 @@ func (t *TestTaskCtx) Do(ctx context.Context) error {
 	return nil
 }
 
+// ID returns the test task’s identifier.
 func (t *TestTaskCtx) ID() string {
 	return t.id
 }
 
+// TestNewScheduler verifies the NewScheduler function’s behavior.
+// It tests successful creation, empty name errors, and nil pool errors.
 func TestNewScheduler(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		pool := NewPool(1)
@@ -80,8 +95,10 @@ func TestNewScheduler(t *testing.T) {
 	})
 }
 
+// TestScheduler_Do verifies the Do method of Scheduler.
+// It tests task execution with a limited number of runs.
 func TestScheduler_Do(t *testing.T) {
-	pool := NewPool(1, PoolingWithQueueSize(10)) // Increase queue size to avoid ErrQueueFull
+	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
 	schedule := Routine{Interval: 100 * time.Millisecond, MaxRuns: 3}
 	scheduler, err := NewScheduler("test", pool, schedule)
@@ -114,6 +131,8 @@ func TestScheduler_Do(t *testing.T) {
 	}
 }
 
+// TestScheduler_DoCtx verifies the DoCtx method of Scheduler.
+// It tests context-aware task execution with a limited number of runs.
 func TestScheduler_DoCtx(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
@@ -146,6 +165,8 @@ func TestScheduler_DoCtx(t *testing.T) {
 	}
 }
 
+// TestScheduler_Stop verifies the Stop method of Scheduler.
+// It ensures tasks stop executing after Stop is called.
 func TestScheduler_Stop(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
@@ -180,6 +201,8 @@ func TestScheduler_Stop(t *testing.T) {
 	}
 }
 
+// TestScheduler_ImmediateFirstRun verifies that Scheduler executes the first task immediately.
+// It checks for at least one run shortly after starting.
 func TestScheduler_ImmediateFirstRun(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
@@ -203,6 +226,8 @@ func TestScheduler_ImmediateFirstRun(t *testing.T) {
 	scheduler.Stop()
 }
 
+// TestScheduler_MaxRuns verifies that Scheduler respects the MaxRuns limit.
+// It ensures the task runs exactly the specified number of times.
 func TestScheduler_MaxRuns(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
@@ -234,6 +259,8 @@ func TestScheduler_MaxRuns(t *testing.T) {
 	}
 }
 
+// TestScheduler_NonIntervalMaxRuns verifies Scheduler behavior with no interval and MaxRuns set.
+// It ensures all runs occur quickly without delays.
 func TestScheduler_NonIntervalMaxRuns(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
@@ -255,6 +282,8 @@ func TestScheduler_NonIntervalMaxRuns(t *testing.T) {
 	}
 }
 
+// TestScheduler_AlreadyRunning verifies that Scheduler rejects new tasks while running.
+// It checks for the correct error when attempting to start a second task.
 func TestScheduler_AlreadyRunning(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
@@ -277,6 +306,8 @@ func TestScheduler_AlreadyRunning(t *testing.T) {
 	scheduler.Stop()
 }
 
+// TestScheduler_StopNotRunning verifies that Stop fails when the Scheduler is not running.
+// It checks for the correct error in the idle state.
 func TestScheduler_StopNotRunning(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
@@ -289,6 +320,8 @@ func TestScheduler_StopNotRunning(t *testing.T) {
 	}
 }
 
+// TestScheduler_ContextCancellation verifies that Scheduler respects context cancellation.
+// It ensures tasks stop after the context is cancelled.
 func TestScheduler_ContextCancellation(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10))
 	defer pool.Shutdown(5 * time.Second)
@@ -315,7 +348,7 @@ func TestScheduler_ContextCancellation(t *testing.T) {
 	t.Log("Stopping scheduler")
 	scheduler.Stop()
 
-	time.Sleep(50 * time.Millisecond) // Reduced to minimize logging
+	time.Sleep(50 * time.Millisecond)
 
 	finalRuns := task.runCount
 	if finalRuns > initialRuns+1 {
@@ -323,6 +356,8 @@ func TestScheduler_ContextCancellation(t *testing.T) {
 	}
 }
 
+// TestScheduler_ObservableEvents verifies that Scheduler emits expected observable events.
+// It checks for started, tick, and run limit events during execution.
 func TestScheduler_ObservableEvents(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(10), PoolingWithObservable(NewObservable[Event]()))
 	defer pool.Shutdown(5 * time.Second)
@@ -386,12 +421,17 @@ eventLoop:
 	mockObs.Shutdown()
 }
 
+// mockSchedulerObserver is a test implementation of the Observable interface for Schedule events.
+// It collects events in a channel for verification.
+// Thread-safe via mutex and channel operations.
 type mockSchedulerObserver struct {
-	events chan Schedule
-	mu     sync.Mutex
-	obs    []Observer[Schedule]
+	events chan Schedule        // Channel for received events
+	mu     sync.Mutex           // Protects obs list
+	obs    []Observer[Schedule] // Registered observers
 }
 
+// newMockSchedulerObserver creates a new mock observer for scheduler events.
+// Thread-safe via initialization.
 func newMockSchedulerObserver() *mockSchedulerObserver {
 	return &mockSchedulerObserver{
 		events: make(chan Schedule, 100),
@@ -399,20 +439,22 @@ func newMockSchedulerObserver() *mockSchedulerObserver {
 	}
 }
 
+// Add registers one or more observers to receive Schedule events.
+// Thread-safe via mutex.
 func (m *mockSchedulerObserver) Add(observers ...Observer[Schedule]) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	for _, observer := range observers {
 		m.obs = append(m.obs, observer)
 	}
-
 }
 
+// Remove unregisters one or more observers from receiving Schedule events.
+// It removes the first occurrence of each observer.
+// Thread-safe via mutex.
 func (m *mockSchedulerObserver) Remove(observers ...Observer[Schedule]) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	for _, observer := range observers {
 		for i, obs := range m.obs {
 			if obs == observer {
@@ -421,23 +463,24 @@ func (m *mockSchedulerObserver) Remove(observers ...Observer[Schedule]) {
 			}
 		}
 	}
-
 }
 
+// Notify sends one or more Schedule events to all registered observers.
+// Thread-safe via mutex and observer iteration.
 func (m *mockSchedulerObserver) Notify(events ...Schedule) {
 	m.mu.Lock()
 	observers := make([]Observer[Schedule], len(m.obs))
 	copy(observers, m.obs)
 	m.mu.Unlock()
-
 	for _, event := range events {
 		for _, obs := range observers {
 			obs.OnNotify(event)
 		}
 	}
-
 }
 
+// OnNotify receives a Schedule event and forwards it to the events channel.
+// Thread-safe via non-blocking channel send.
 func (m *mockSchedulerObserver) OnNotify(event Schedule) {
 	select {
 	case m.events <- event:
@@ -445,6 +488,8 @@ func (m *mockSchedulerObserver) OnNotify(event Schedule) {
 	}
 }
 
+// Shutdown closes the events channel to stop event collection.
+// Thread-safe via channel close.
 func (m *mockSchedulerObserver) Shutdown() {
 	close(m.events)
 }

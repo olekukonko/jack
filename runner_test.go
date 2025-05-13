@@ -1,3 +1,4 @@
+// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -11,6 +12,7 @@ import (
 	"time"
 )
 
+// TestRunner_NewRunner verifies that NewRunner creates a non-nil Runner instance.
 func TestRunner_NewRunner(t *testing.T) {
 	r := NewRunner()
 	if r == nil {
@@ -19,6 +21,8 @@ func TestRunner_NewRunner(t *testing.T) {
 	defer r.Shutdown(1 * time.Second)
 }
 
+// TestRunner_Do_SimpleTask verifies that Runner executes a simple task correctly.
+// It checks task execution, event emission, and error handling.
 func TestRunner_Do_SimpleTask(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -58,6 +62,8 @@ func TestRunner_Do_SimpleTask(t *testing.T) {
 	}
 }
 
+// TestRunner_Do_SequentialExecution verifies that Runner executes tasks sequentially.
+// It checks the order of task execution using a shared run order list.
 func TestRunner_Do_SequentialExecution(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](2) // Increased workers for faster event processing
@@ -100,6 +106,8 @@ func TestRunner_Do_SequentialExecution(t *testing.T) {
 	}
 }
 
+// TestRunner_Do_TaskWithErrorAndPanic verifies that Runner handles task errors and panics.
+// It checks for correct error reporting and CaughtPanic instances.
 func TestRunner_Do_TaskWithErrorAndPanic(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -129,6 +137,8 @@ func TestRunner_Do_TaskWithErrorAndPanic(t *testing.T) {
 	}
 }
 
+// TestRunner_DoCtx_Cancellation verifies that Runner respects context cancellation during task submission.
+// It ensures cancelled tasks are not executed.
 func TestRunner_DoCtx_Cancellation(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -171,6 +181,8 @@ func TestRunner_DoCtx_Cancellation(t *testing.T) {
 	}
 }
 
+// TestRunner_DoCtx_TaskRespectsContext verifies that Runner tasks respect their context’s deadline.
+// It checks for DeadlineExceeded errors on timeout.
 func TestRunner_DoCtx_TaskRespectsContext(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)
@@ -194,6 +206,8 @@ func TestRunner_DoCtx_TaskRespectsContext(t *testing.T) {
 	}
 }
 
+// TestRunner_Do_ErrQueueFull verifies that Runner returns ErrQueueFull when the task queue is full.
+// It ensures queue capacity limits are enforced.
 func TestRunner_Do_ErrQueueFull(t *testing.T) {
 	runner := NewRunner(WithRunnerQueueSize(1)) // Use queue size 1
 	defer runner.Shutdown(1 * time.Second)
@@ -228,6 +242,8 @@ func TestRunner_Do_ErrQueueFull(t *testing.T) {
 	<-task1Done
 }
 
+// TestRunner_Shutdown verifies that Runner shuts down correctly and rejects new tasks.
+// It checks that all queued tasks run and post-shutdown submissions fail.
 func TestRunner_Shutdown(t *testing.T) {
 	runner := NewRunner(WithRunnerQueueSize(5))
 	var tasksRun int32
@@ -255,6 +271,8 @@ func TestRunner_Shutdown(t *testing.T) {
 	}
 }
 
+// TestRunner_Shutdown_Timeout verifies that Runner returns ErrShutdownTimedOut for long-running tasks.
+// It ensures timeout behavior during shutdown.
 func TestRunner_Shutdown_Timeout(t *testing.T) {
 	runner := NewRunner()
 	longTaskDone := make(chan struct{})
@@ -272,6 +290,8 @@ func TestRunner_Shutdown_Timeout(t *testing.T) {
 	<-longTaskDone
 }
 
+// TestRunner_TaskIDGeneration verifies that Runner generates correct task IDs.
+// It tests default, custom, and Identifiable-based ID generation.
 func TestRunner_TaskIDGeneration(t *testing.T) {
 	collector := newEventCollector()
 	obsable := NewObservable[Event](1)

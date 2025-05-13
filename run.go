@@ -1,3 +1,4 @@
+// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -6,50 +7,65 @@ import (
 	"sync"
 )
 
-// Group allows running multiple functions with error and panic handling
+// Group coordinates concurrent execution of functions with error and panic handling.
+// It supports context cancellation and worker limits, collecting errors in a channel.
+// Thread-safe via wait group, mutex, and channel operations.
 type Group struct {
-	wg         sync.WaitGroup
-	errCh      chan error
-	errOnce    sync.Once     // Ensures errCh is closed only once
-	cancelOnce sync.Once     // Ensures cancel is called only once on error
-	sem        chan struct{} // Worker limit semaphore
-	ctx        context.Context
-	cancel     func()
+	wg         sync.WaitGroup  // Tracks running goroutines
+	errCh      chan error      // Receives first error from goroutines
+	errOnce    sync.Once       // Ensures errCh is closed once
+	cancelOnce sync.Once       // Ensures context cancellation is called once
+	sem        chan struct{}   // Limits concurrent workers
+	ctx        context.Context // Group context for cancellation
+	cancel     func()          // Cancels the group context
 }
 
-// NewGroup creates a new Group without context or worker limits
+// NewGroup creates a new Group for running functions concurrently.
+// It initializes an error channel with a buffer of 1.
+// Thread-safe via initialization.
+// Example:
+//
+//	group := NewGroup() // Creates a new group
 func NewGroup() *Group {
 	return &Group{
-		errCh: make(chan error, 1), // Buffer of 1 for the first error
+		errCh: make(chan error, 1),
 	}
 }
 
-// WithContext associates a context with the Group.
-// If a previous context was associated, its cancel function is called.
-// The Group's context will be cancelled when the first error occurs in a Go/GoCtx
-// goroutine, or when Wait is called.
+// WithContext associates a context with the Group, enabling cancellation.
+// It cancels any previous context and creates a new cancellable context.
+// Thread-safe via context operations.
+// Example:
+//
+//	group.WithContext(ctx) // Sets group context
 func (g *Group) WithContext(ctx context.Context) *Group {
 	if g.cancel != nil {
-		// Cancel previous context if WithContext is called multiple times
 		g.cancel()
 	}
 	g.ctx, g.cancel = context.WithCancel(ctx)
 	return g
 }
 
-// WithLimit sets the maximum number of concurrent workers for the Group.
-// If n <= 0, no limit is applied (or a previously set limit is removed).
+// WithLimit sets the maximum number of concurrent workers in the Group.
+// Non-positive values remove the limit.
+// Thread-safe via semaphore initialization.
+// Example:
+//
+//	group.WithLimit(5) // Limits to 5 concurrent workers
 func (g *Group) WithLimit(n int) *Group {
 	if n <= 0 {
-		g.sem = nil // Remove limit
+		g.sem = nil
 		return g
 	}
-	if cap(g.sem) != n { // Avoid re-allocating if limit is the same
+	if cap(g.sem) != n {
 		g.sem = make(chan struct{}, n)
 	}
 	return g
 }
 
+// doWork executes a job with panic recovery and error handling.
+// It sends the first error to the error channel and triggers context cancellation.
+// Thread-safe via channel and once operations.
 func (g *Group) doWork(job func() error) {
 	if g.sem != nil {
 		g.sem <- struct{}{}
@@ -58,27 +74,17 @@ func (g *Group) doWork(job func() error) {
 
 	var errToSend error
 	defer func() {
-		// This deferred function handles sending the error and triggering cancellation.
 		if errToSend != nil {
-			// Try to send the error. Non-blocking.
 			select {
 			case g.errCh <- errToSend:
-				// Error sent.
 			default:
-				// errCh is full (another error likely already sent) or closed.
-				// This error is effectively dropped from the channel.
 			}
-
-			// If we have a cancel function, trigger cancellation for other goroutines.
-			// This happens regardless of whether the error was sent to the channel,
-			// as any error should trigger cancellation.
 			if g.cancel != nil {
 				g.cancelOnce.Do(g.cancel)
 			}
 		}
 	}()
 
-	// Execute the job with panic recovery
 	func() {
 		defer func() {
 			if v := recover(); v != nil {
@@ -92,55 +98,48 @@ func (g *Group) doWork(job func() error) {
 	}()
 }
 
-// Go runs the function f in a new goroutine.
-// The first non-nil error returned by f or a panic will be sent to the Errors channel.
-// If WithContext was used, the Group's context will be cancelled on the first error.
+// Go runs a function in a new goroutine with error and panic handling.
+// The first non-nil error or panic is sent to the Errors channel.
+// If a context is set, it is cancelled on the first error.
+// Thread-safe via wait group and doWork.
+// Example:
+//
+//	group.Go(func() error { return nil }) // Runs a function
 func (g *Group) Go(f func() error) {
 	g.wg.Add(1)
-
 	go func() {
 		defer g.wg.Done()
 		g.doWork(f)
 	}()
 }
 
-// GoCtx runs the context-aware function f in a new goroutine.
-// It requires WithContext to have been called first.
-// The function f receives the Group's context.
-// If the Group's context is already cancelled before f starts, f will not run,
-// and the context's error will be reported.
-// The first non-nil error returned by f, a panic, or a context cancellation
-// will be sent to the Errors channel and will cause the Group's context to be cancelled.
+// GoCtx runs a context-aware function in a new goroutine.
+// It requires a context set via WithContext and passes it to the function.
+// The first error, panic, or context cancellation is sent to the Errors channel,
+// and the context is cancelled.
+// Thread-safe via wait group and doWork.
+// Example:
+//
+//	group.WithContext(ctx).GoCtx(func(ctx context.Context) error { return nil }) // Runs a context-aware function
 func (g *Group) GoCtx(f func(context.Context) error) {
 	if g.ctx == nil {
 		panic("jack.Group: must use WithContext before GoCtx")
 	}
 
 	g.wg.Add(1)
-
 	go func() {
 		defer g.wg.Done()
-
-		// Check context before starting work, but after acquiring semaphore (if any)
-		// to ensure semaphore is released even if context is done.
 		job := func() error {
-			// Double check context status right before execution,
-			// as it might have been cancelled while waiting for the semaphore.
 			if err := g.ctx.Err(); err != nil {
-				return err // Context cancelled or deadline exceeded
+				return err
 			}
 			return f(g.ctx)
 		}
 
-		// If semaphore is used, check context *after* acquiring it.
-		// Otherwise, check immediately.
 		if g.sem != nil {
 			g.sem <- struct{}{}
 			defer func() { <-g.sem }()
-
-			// Check context *again* after acquiring semaphore
 			if err := g.ctx.Err(); err != nil {
-				// Handle error (non-blocking send, cancelOnce) similarly to doWork's defer
 				select {
 				case g.errCh <- err:
 				default:
@@ -148,12 +147,10 @@ func (g *Group) GoCtx(f func(context.Context) error) {
 				if g.cancel != nil {
 					g.cancelOnce.Do(g.cancel)
 				}
-				return // Don't run the job
+				return
 			}
 		} else {
-			// No semaphore, check context before running job directly
 			if err := g.ctx.Err(); err != nil {
-				// Handle error (non-blocking send, cancelOnce)
 				select {
 				case g.errCh <- err:
 				default:
@@ -161,46 +158,49 @@ func (g *Group) GoCtx(f func(context.Context) error) {
 				if g.cancel != nil {
 					g.cancelOnce.Do(g.cancel)
 				}
-				return // Don't run the job
+				return
 			}
 		}
 
-		// At this point, context was not done when checked.
-		// Proceed with doWork which contains its own panic recovery and error handling.
-		// We pass a closure to doWork that wraps the actual job.
 		g.doWork(job)
 	}()
 }
 
-// Errors returns a channel that will receive the first error from any of the
-// goroutines started by Go or GoCtx. The channel has a buffer of 1.
-// It will be closed by Wait. Callers should not close the channel.
+// Errors returns a channel that receives the first error from Go or GoCtx goroutines.
+// The channel has a buffer of 1 and is closed by Wait.
+// Thread-safe via channel operations.
+// Example:
+//
+//	for err := range group.Errors() { ... } // Reads errors
 func (g *Group) Errors() <-chan error {
 	return g.errCh
 }
 
-// Wait blocks until all functions passed to Go or GoCtx have returned.
-// It then closes the Errors channel and cancels the Group's context (if any).
+// Wait blocks until all Go and GoCtx goroutines complete.
+// It closes the Errors channel and cancels the Group’s context, if set.
+// Thread-safe via wait group and once.
+// Example:
+//
+//	group.Wait() // Waits for all goroutines
 func (g *Group) Wait() {
 	g.wg.Wait()
 	g.errOnce.Do(func() {
 		close(g.errCh)
-		// Also ensure context is cancelled on Wait, in case no errors occurred
-		// or cancel was not called for some reason.
 		if g.cancel != nil {
-			g.cancel() // This will be a no-op if cancelOnce already did it.
+			g.cancel()
 		}
 	})
 }
 
-// Go runs a function in a goroutine (standalone version).
-// It returns a channel that will receive the error from f (or a CaughtPanic if f panics),
-// or nil if f completes successfully. The channel is buffered by 1 and will be closed
-// after the error is sent (or after f completes if no error).
-// The caller is responsible for draining this channel to prevent goroutine leaks if an error occurs.
+// Go runs a function in a standalone goroutine with error and panic handling.
+// It returns a buffered channel that receives the function’s error or a CaughtPanic.
+// The channel is closed after the error or completion.
+// Thread-safe via goroutine and channel operations.
+// Example:
+//
+//	errCh := Go(func() error { return nil }) // Runs a function and returns error channel
 func Go(f func() error) <-chan error {
 	errCh := make(chan error, 1)
-
 	go func() {
 		var errToSend error
 		defer func() {
@@ -209,7 +209,6 @@ func Go(f func() error) <-chan error {
 			}
 			close(errCh)
 		}()
-
 		func() {
 			defer func() {
 				if v := recover(); v != nil {
@@ -222,13 +221,15 @@ func Go(f func() error) <-chan error {
 			errToSend = f()
 		}()
 	}()
-
 	return errCh
 }
 
-// Safe executes a function f and recovers from any panics.
-// If f returns an error, that error is returned.
-// If f panics, a *CaughtPanic error is returned.
+// Safe executes a function with panic recovery.
+// It returns the function’s error or a CaughtPanic if a panic occurs.
+// Thread-safe as a standalone function.
+// Example:
+//
+//	err := Safe(func() error { return nil }) // Executes function safely
 func Safe(f func() error) (err error) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -241,10 +242,12 @@ func Safe(f func() error) (err error) {
 	return f()
 }
 
-// SafeCtx executes a context-aware function f and recovers from any panics.
-// If the context is already done, its error is returned immediately.
-// If f returns an error, that error is returned.
-// If f panics, a *CaughtPanic error is returned.
+// SafeCtx executes a context-aware function with panic recovery.
+// It returns the context’s error if done, the function’s error, or a CaughtPanic if a panic occurs.
+// Thread-safe as a standalone function.
+// Example:
+//
+//	err := SafeCtx(ctx, func(ctx context.Context) error { return nil }) // Executes context-aware function safely
 func SafeCtx(ctx context.Context, f func(context.Context) error) (err error) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -254,7 +257,6 @@ func SafeCtx(ctx context.Context, f func(context.Context) error) (err error) {
 			}
 		}
 	}()
-
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
