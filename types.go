@@ -5,9 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/oklog/ulid/v2"
 	"github.com/olekukonko/ll"
-	"strings"
 	"time"
 )
 
@@ -15,7 +13,10 @@ import (
 const defaultNumNotifyWorkers = 100
 
 // retryScheduler specifies the number of retry attempts for submitting tasks when the queue is full.
-const retryScheduler = 3
+const (
+	retryScheduler        = 3
+	retrySchedulerBackoff = time.Millisecond * 100
+)
 
 // Errors returned by the worker pool and task execution.
 var (
@@ -74,18 +75,6 @@ type TaskCtx interface {
 	Do(ctx context.Context) error
 }
 
-// CaughtPanic captures a panic during task execution with its value and stack trace.
-// Thread-safe for use in error handling across goroutines.
-type CaughtPanic struct {
-	Val   any    // The panic value
-	Stack []byte // The stack trace
-}
-
-// Error returns a formatted string describing the panic and its stack trace.
-func (e *CaughtPanic) Error() string {
-	return fmt.Sprintf("panic: %q\n%s", e.Val, string(e.Stack))
-}
-
 // Event captures details of task execution for observability.
 // Thread-safe for use in notification across goroutines.
 type Event struct {
@@ -131,51 +120,33 @@ type Routine struct {
 	MaxRuns  int           // Maximum number of runs (0 for unlimited)
 }
 
-// tasker wraps a Task or TaskCtx with a context and ID generation logic.
-// It implements the job interface for execution in the worker pool.
-// Thread-safe via context and immutable fields.
-type tasker struct {
-	task            interface{}              // Task or TaskCtx to execute
-	ctx             context.Context          // Context for TaskCtx or Background for Task
-	taskIDGenerator func(interface{}) string // Optional ID generator
-	defaultIDPrefix string                   // Prefix for generated IDs
+// Package jack provides utilities for safe, context-aware function execution with mutex protection.
+// It includes methods to execute functions with panic recovery, context cancellation support,
+// and mutex locking, eliminating the need for verbose boilerplate when handling timeouts or cancellations.
+
+// CaughtPanic represents a panic that was caught during execution.
+type CaughtPanic struct {
+	Val   interface{} // The value passed to panic()
+	Stack []byte      // The stack trace (may be empty if not collected)
 }
 
-// Context returns the task's associated context, defaulting to context.Background if none is set.
-func (tj *tasker) Context() context.Context {
-	if tj.ctx == nil {
-		return context.Background()
+// Error implements the error interface.
+func (c *CaughtPanic) Error() string {
+	if c.Stack != nil {
+		return fmt.Sprintf("panic: %v\nstack:\n%s", c.Val, c.Stack)
 	}
-	return tj.ctx
+	return fmt.Sprintf("panic: %v", c.Val)
 }
 
-// ID generates a unique identifier for the task.
-// It uses the taskIDGenerator, Identifiable.ID, or a generated ID with the default prefix.
-func (tj *tasker) ID() string {
-	if tj.taskIDGenerator != nil {
-		if id := tj.taskIDGenerator(tj.task); id != "" {
-			return id
-		}
-	}
-	if identifiable, ok := tj.task.(Identifiable); ok {
-		if id := identifiable.ID(); id != "" {
-			return id
-		}
-	}
-	if tj.task == nil {
-		return strings.Join([]string{tj.defaultIDPrefix, "nil_task", ulid.Make().String()}, ".")
-	}
-	return strings.Join([]string{tj.defaultIDPrefix, ulid.Make().String()}, ".")
+// String provides a formatted string representation of the panic.
+func (c *CaughtPanic) String() string {
+	return c.Error()
 }
 
-// Run executes the wrapped Task or TaskCtx using the stored context.
-// It returns an error if the task type is invalid.
-func (tj *tasker) Run(_ context.Context) error {
-	if taskCtx, ok := tj.task.(TaskCtx); ok {
-		return taskCtx.Do(tj.ctx)
+// Unwrap provides compatibility with errors.Is/As.
+func (c *CaughtPanic) Unwrap() error {
+	if err, ok := c.Val.(error); ok {
+		return err
 	}
-	if task, ok := tj.task.(Task); ok {
-		return task.Do()
-	}
-	return errors.New("invalid task type")
+	return nil
 }
