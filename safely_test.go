@@ -10,15 +10,15 @@ import (
 	"time"
 )
 
-// TestMutex tests the Mutex type and its methods (Do, DoCtx, Safe, SafeCtx).
-func TestMutex(t *testing.T) {
+// TestSafely tests the Safely type and its methods (Do, DoCtx, Safe, SafeCtx).
+func TestSafely(t *testing.T) {
 	t.Run("Do", func(t *testing.T) {
-		var mu Mutex
+		var mu Safely
 		var counter int
 		var wg sync.WaitGroup
 		wg.Add(2)
 
-		// Test concurrent execution with mutex protection
+		// Test concurrent execution with Safely protection
 		go func() {
 			defer wg.Done()
 			mu.Do(func() {
@@ -50,7 +50,7 @@ func TestMutex(t *testing.T) {
 	})
 
 	t.Run("DoCtx", func(t *testing.T) {
-		var mu Mutex
+		var mu Safely
 
 		// Test normal execution
 		var called bool
@@ -100,7 +100,7 @@ func TestMutex(t *testing.T) {
 	})
 
 	t.Run("Safe", func(t *testing.T) {
-		var mu Mutex
+		var mu Safely
 
 		// Test normal execution
 		err := mu.Safe(func() error { return nil })
@@ -122,7 +122,7 @@ func TestMutex(t *testing.T) {
 	})
 
 	t.Run("SafeCtx", func(t *testing.T) {
-		var mu Mutex
+		var mu Safely
 
 		// Test normal execution
 		err := mu.SafeCtx(context.Background(), func() error { return nil })
@@ -324,9 +324,9 @@ func TestCaughtPanic(t *testing.T) {
 	})
 }
 
-// TestConcurrent tests concurrent usage of Mutex methods.
+// TestConcurrent tests concurrent usage of Safely methods.
 func TestConcurrent(t *testing.T) {
-	var mu Mutex
+	var mu Safely
 	var counter int
 	var wg sync.WaitGroup
 	n := 100

@@ -6,8 +6,8 @@ import (
 	"sync"
 )
 
-// Mutex wraps sync.Mutex with safe execution methods.
-type Mutex struct {
+// Safely wraps sync.Mutex with safe execution methods.
+type Safely struct {
 	sync.Mutex
 }
 
@@ -16,12 +16,12 @@ type Mutex struct {
 // If fn is nil, Do will panic.
 // Example:
 //
-//	var mu Mutex
+//	var mu Safely
 //	mu.Do(func() {
 //	    // Critical section
 //	    fmt.Println("Safe execution")
 //	})
-func (m *Mutex) Do(fn func()) {
+func (m *Safely) Do(fn func()) {
 	m.Lock()
 	defer m.Unlock()
 	fn()
@@ -44,7 +44,7 @@ func (m *Mutex) Do(fn func()) {
 //	    return nil
 //	})
 //	// err will likely be context.DeadlineExceeded due to timeout
-func (m *Mutex) DoCtx(ctx context.Context, fn func() error) error {
+func (m *Safely) DoCtx(ctx context.Context, fn func() error) error {
 	m.Lock()
 	defer m.Unlock()
 	// Delegate to safeCtx without stack capture, as DoCtx doesn't need panic recovery
@@ -56,7 +56,7 @@ func (m *Mutex) DoCtx(ctx context.Context, fn func() error) error {
 // If fn is nil, Safe will return a *CaughtPanic.
 // Example:
 //
-//	var mu Mutex
+//	var mu Safely
 //	err := mu.Safe(func() error {
 //	    // Critical section
 //	    return nil
@@ -64,7 +64,7 @@ func (m *Mutex) DoCtx(ctx context.Context, fn func() error) error {
 //	if err != nil {
 //	    fmt.Println("Error:", err)
 //	}
-func (m *Mutex) Safe(fn func() error) error {
+func (m *Safely) Safe(fn func() error) error {
 	m.Lock()
 	defer m.Unlock()
 	return safe(fn, true)
@@ -86,7 +86,7 @@ func (m *Mutex) Safe(fn func() error) error {
 //	    return nil
 //	})
 //	// err will likely be context.DeadlineExceeded due to timeout
-func (m *Mutex) SafeCtx(ctx context.Context, fn func() error) error {
+func (m *Safely) SafeCtx(ctx context.Context, fn func() error) error {
 	m.Lock()
 	defer m.Unlock()
 	return SafeCtx(ctx, fn)
