@@ -5,8 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/olekukonko/ll"
 	"time"
+
+	"github.com/olekukonko/ll"
 )
 
 // defaultNumNotifyWorkers specifies the default number of notification workers in the pool.
@@ -149,4 +150,34 @@ func (c *CaughtPanic) Unwrap() error {
 		return err
 	}
 	return nil
+}
+
+// Do wraps a function with no return value into a Task.
+// Useful for fire-and-forget or simple operations that don’t produce errors.
+//
+// Example:
+//
+//	pool.Submit(jack.Do(func() {
+//	    fmt.Println("Hello from task")
+//	}))
+func Do(fn func()) Task {
+	return Func(func() error {
+		fn()
+		return nil
+	})
+}
+
+// DoCtx wraps a context-aware function with no return value into a TaskCtx.
+// Useful when you only need context propagation without returning an error.
+//
+// Example:
+//
+//	pool.SubmitCtx(ctx, jack.DoCtx(func(ctx context.Context) {
+//	    fmt.Println("Running with context:", ctx)
+//	}))
+func DoCtx(fn func(ctx context.Context)) TaskCtx {
+	return FuncCtx(func(ctx context.Context) error {
+		fn(ctx)
+		return nil
+	})
 }

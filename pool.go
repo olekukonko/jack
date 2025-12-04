@@ -3,10 +3,11 @@ package jack
 import (
 	"context"
 	"fmt"
-	"github.com/olekukonko/ll"
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/olekukonko/ll"
 )
 
 // Pool manages a fixed number of worker goroutines to execute tasks concurrently.
@@ -113,6 +114,17 @@ func (p *Pool) Logger(extLogger *ll.Logger) *Pool {
 		p.logger = extLogger.Namespace("pool")
 	}
 	return p
+}
+
+// Do is a shorthand for pool.Submit(Func(...)) but discards any returned error.
+// It exists purely for ergonomic, fire-and-forget usage.
+func (p *Pool) Do(fn func()) {
+	_ = p.Submit(Func(func() error { fn(); return nil }))
+}
+
+// DoCtx is a shorthand for pool.SubmitCtx(FuncCtx(...)) but discards any returned error.
+func (p *Pool) DoCtx(ctx context.Context, fn func(ctx context.Context)) {
+	_ = p.SubmitCtx(ctx, FuncCtx(func(ctx context.Context) error { fn(ctx); return nil }))
 }
 
 // Submit enqueues one or more tasks to the pool for execution without context.
