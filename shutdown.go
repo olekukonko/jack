@@ -141,13 +141,9 @@ func NewShutdown(opts ...ShutdownOption) *Shutdown {
 	signal.Notify(sm.signalChan, sm.signals...)
 
 	// Setup Context
-	var ctx context.Context
-	var cancel context.CancelFunc
-	if sm.timeout > 0 {
-		ctx, cancel = context.WithTimeout(context.Background(), sm.timeout)
-	} else {
-		ctx, cancel = context.WithCancel(context.Background())
-	}
+	// We only apply the timeout during the actual shutdown phase.
+	ctx, cancel := context.WithCancel(context.Background())
+
 	sm.shutdownCtx = ctx
 	sm.cancelFunc = cancel
 
@@ -379,11 +375,25 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 
 	sm.log("starting shutdown of %d task(s)", len(events))
 
+	// Crucially, use sm.shutdownCtx as the parent.
+	// This ensures that if ForceQuitMonitor calls sm.cancelFunc(),
+	// this context (and the tasks using it) are cancelled immediately.
+	var cleanupCtx context.Context
+	var cleanupCancel context.CancelFunc
+
+	if sm.timeout > 0 {
+		// Apply the timeout NOW, relative to when shutdown started
+		cleanupCtx, cleanupCancel = context.WithTimeout(sm.shutdownCtx, sm.timeout)
+	} else {
+		cleanupCtx, cleanupCancel = context.WithCancel(sm.shutdownCtx)
+	}
+	defer cleanupCancel()
+
 	if len(events) > 0 {
 		if sm.concurrent {
-			sm.executeConcurrent(events)
+			sm.executeConcurrent(events, cleanupCtx) // Pass cleanupCtx
 		} else {
-			sm.executeSequential(events)
+			sm.executeSequential(events, cleanupCtx) // Pass cleanupCtx
 		}
 	}
 
@@ -404,13 +414,13 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 // executeSequential runs cleanup tasks in LIFO order (last registered first).
 // Blocks until all tasks complete or context is cancelled.
 // Updates completion/failure counters for each task.
-func (sm *Shutdown) executeSequential(events []namedCall) {
+func (sm *Shutdown) executeSequential(events []namedCall, ctx context.Context) {
 	// LIFO (Last-In-First-Out) execution
 	for i := len(events) - 1; i >= 0; i-- {
 		nc := events[i]
 		sm.log("running: %s", nc.Name)
 
-		if err := nc.Fn(sm.shutdownCtx); err != nil {
+		if err := nc.Fn(ctx); err != nil {
 			sm.log("task failed: %s -> %v", nc.Name, err)
 			sm.recordError(err)
 			sm.statsMu.Lock()
@@ -427,7 +437,7 @@ func (sm *Shutdown) executeSequential(events []namedCall) {
 // executeConcurrent runs all cleanup tasks in parallel using goroutines.
 // Collects errors via channel and waits for completion with WaitGroup.
 // Significantly faster for independent cleanup operations.
-func (sm *Shutdown) executeConcurrent(events []namedCall) {
+func (sm *Shutdown) executeConcurrent(events []namedCall, ctx context.Context) {
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(events))
 
@@ -436,7 +446,7 @@ func (sm *Shutdown) executeConcurrent(events []namedCall) {
 		go func(task namedCall) {
 			defer wg.Done()
 			sm.log("running (concurrent): %s", task.Name)
-			errChan <- task.Fn(sm.shutdownCtx)
+			errChan <- task.Fn(ctx)
 		}(nc)
 	}
 
@@ -490,6 +500,7 @@ func (sm *Shutdown) recordError(err error) {
 
 // GetStats returns a deep copy of current shutdown statistics.
 // Safe for concurrent reads; protects against mutation during access.
+// Used by public APIs to return final results.
 // Used by public APIs to return final results.
 func (sm *Shutdown) GetStats() *ShutdownStats {
 	sm.statsMu.RLock()
