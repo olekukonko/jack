@@ -12,7 +12,7 @@ import (
 
 // TestShutdownDefaults verifies the default configuration values.
 func TestShutdownDefaults(t *testing.T) {
-	sm := NewShutdownManager()
+	sm := NewShutdown()
 
 	if sm.timeout != 30*time.Second {
 		t.Fatalf("expected default timeout 30s, got %v", sm.timeout)
@@ -31,7 +31,7 @@ func TestShutdownDefaults(t *testing.T) {
 // TestShutdownTimeout verifies that the global timeout cancels the context.
 func TestShutdownTimeout(t *testing.T) {
 	// Set a very short timeout
-	sm := NewShutdownManager(ShutdownWithTimeout(50 * time.Millisecond))
+	sm := NewShutdown(ShutdownWithTimeout(50 * time.Millisecond))
 
 	// Trigger shutdown to start the clock
 	go sm.TriggerShutdown()
@@ -47,7 +47,7 @@ func TestShutdownTimeout(t *testing.T) {
 // TestShutdownForceQuit verifies that the force quit monitor cancels the context
 // if the tasks take too long, even if the main timeout is infinite (0).
 func TestShutdownForceQuit(t *testing.T) {
-	sm := NewShutdownManager(
+	sm := NewShutdown(
 		ShutdownWithTimeout(0), // Infinite wait
 		ShutdownWithForceQuit(20*time.Millisecond),
 	)
@@ -79,7 +79,7 @@ func TestShutdownForceQuit(t *testing.T) {
 
 // TestShutdownLIFO verifies that tasks run in Last-In-First-Out order (Sequential).
 func TestShutdownLIFO(t *testing.T) {
-	sm := NewShutdownManager(ShutdownWithTimeout(100 * time.Millisecond))
+	sm := NewShutdown(ShutdownWithTimeout(100 * time.Millisecond))
 
 	var order []string
 	var mu sync.Mutex
@@ -108,7 +108,7 @@ func TestShutdownLIFO(t *testing.T) {
 
 // TestShutdownConcurrent verifies that tasks run in parallel.
 func TestShutdownConcurrent(t *testing.T) {
-	sm := NewShutdownManager(
+	sm := NewShutdown(
 		ShutdownWithTimeout(500*time.Millisecond),
 		ShutdownConcurrent(),
 	)
@@ -138,7 +138,7 @@ func TestShutdownConcurrent(t *testing.T) {
 
 // TestShutdownPanicRecovery verifies that a panic in a callback is caught and recorded as an error.
 func TestShutdownPanicRecovery(t *testing.T) {
-	sm := NewShutdownManager()
+	sm := NewShutdown()
 
 	_ = sm.Register(func() {
 		panic("oops")
@@ -160,7 +160,7 @@ func TestShutdownPanicRecovery(t *testing.T) {
 
 // TestShutdownTypes verifies that Register accepts all supported types/interfaces.
 func TestShutdownTypes(t *testing.T) {
-	sm := NewShutdownManager()
+	sm := NewShutdown()
 
 	// 1. func()
 	sm.Register(func() {})
@@ -186,7 +186,7 @@ func TestShutdownTypes(t *testing.T) {
 
 // TestShutdownSignal verifies that sending an OS signal triggers the shutdown.
 func TestShutdownSignal(t *testing.T) {
-	sm := NewShutdownManager()
+	sm := NewShutdown()
 
 	var ran atomic.Bool
 	_ = sm.Register(func() {
@@ -209,7 +209,7 @@ func TestShutdownSignal(t *testing.T) {
 
 // TestShutdownWaitChan verifies the async wait channel.
 func TestShutdownWaitChan(t *testing.T) {
-	sm := NewShutdownManager()
+	sm := NewShutdown()
 	_ = sm.Register(func() {})
 
 	go func() { sm.signalChan <- syscall.SIGTERM }()
@@ -222,7 +222,7 @@ func TestShutdownWaitChan(t *testing.T) {
 
 // TestShutdownTrigger verifies programmatic triggering.
 func TestShutdownTrigger(t *testing.T) {
-	sm := NewShutdownManager()
+	sm := NewShutdown()
 	_ = sm.Register(func() {})
 
 	stats := sm.TriggerShutdown()
@@ -236,7 +236,7 @@ func TestShutdownTrigger(t *testing.T) {
 
 // TestShutdownDoubleExecution verifies calling it twice doesn't panic or re-run tasks.
 func TestShutdownDoubleExecution(t *testing.T) {
-	sm := NewShutdownManager()
+	sm := NewShutdown()
 
 	count := 0
 	sm.Register(func() { count++ })
