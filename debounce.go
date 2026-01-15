@@ -167,7 +167,7 @@ func (d *Debouncer) flush() {
 	fn := d.fn
 	d.reset()
 
-	// Execute the function in a new goroutine to avoid blocking the caller of Do/Flush.
+	// Run the function in a new goroutine to avoid blocking the caller of Do/Flush.
 	go fn()
 }
 
