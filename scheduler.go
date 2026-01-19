@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/olekukonko/ll"
 	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/olekukonko/ll"
 )
 
 // Schedule represents an event emitted by the scheduler for observability.
