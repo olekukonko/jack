@@ -4,9 +4,10 @@ package jack
 import (
 	"context"
 	"errors"
-	"github.com/olekukonko/ll"
 	"sync"
 	"time"
+
+	"github.com/olekukonko/ll"
 )
 
 // Runner executes tasks asynchronously using a buffered task queue.
@@ -122,7 +123,7 @@ func (r *Runner) submit(submitCtx context.Context, job job) error {
 	}
 	r.mu.RUnlock()
 
-	r.logger.Debug("attempting to submit job %s (queue len %d)", taskID, len(r.tasks))
+	r.logger.Debugf("attempting to submit job %s (queue len %d)", taskID, len(r.tasks))
 
 	if submitCtx != nil {
 		select {
@@ -130,7 +131,7 @@ func (r *Runner) submit(submitCtx context.Context, job job) error {
 			if r.opts.observable != nil {
 				r.opts.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 			}
-			r.logger.Debug("submitted job %s with context", taskID)
+			r.logger.Debugf("submitted job %s with context", taskID)
 			return nil
 		case <-submitCtx.Done():
 			return submitCtx.Err()
@@ -141,7 +142,7 @@ func (r *Runner) submit(submitCtx context.Context, job job) error {
 			if r.opts.observable != nil {
 				r.opts.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 			}
-			r.logger.Debug("submitted job %s", taskID)
+			r.logger.Debugf("submitted job %s", taskID)
 			return nil
 		default:
 			r.logger.Info("rejected job %s: queue full", taskID)

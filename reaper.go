@@ -110,12 +110,12 @@ func (r *Reaper) Touch(id string) {
 	if task, exists := r.taskMap[id]; exists {
 		task.Deadline = deadline
 		heap.Fix(&r.tasks, task.index)
-		r.logger.Debug("Reaper.Touch: updated task %s to deadline %v", id, deadline)
+		// r.logger.Debugf("Reaper.Touch: updated task %s to deadline %v", id, deadline)
 	} else {
 		task := &ReaperTask{ID: id, Deadline: deadline}
 		heap.Push(&r.tasks, task)
 		r.taskMap[id] = task
-		r.logger.Debug("Reaper.Touch: added new task %s with deadline %v", id, deadline)
+		// r.logger.Debugf("Reaper.Touch: added new task %s with deadline %v", id, deadline)
 	}
 
 	// Non-blocking signal to wake up loop if this new task is sooner
@@ -136,12 +136,12 @@ func (r *Reaper) TouchAt(id string, deadline time.Time) {
 	if task, exists := r.taskMap[id]; exists {
 		task.Deadline = deadline
 		heap.Fix(&r.tasks, task.index)
-		r.logger.Debug("Reaper.TouchAt: updated task %s to deadline %v", id, deadline)
+		r.logger.Debugf("Reaper.TouchAt: updated task %s to deadline %v", id, deadline)
 	} else {
 		task := &ReaperTask{ID: id, Deadline: deadline}
 		heap.Push(&r.tasks, task)
 		r.taskMap[id] = task
-		r.logger.Debug("Reaper.TouchAt: added new task %s with deadline %v", id, deadline)
+		r.logger.Debugf("Reaper.TouchAt: added new task %s with deadline %v", id, deadline)
 	}
 
 	r.signalLoop()
@@ -160,7 +160,7 @@ func (r *Reaper) Remove(id string) bool {
 
 	removed := r.removeLocked(id)
 	if removed {
-		r.logger.Debug("Reaper.Remove: removed task %s", id)
+		r.logger.Debugf("Reaper.Remove: removed task %s", id)
 	}
 	return removed
 }
@@ -180,7 +180,7 @@ func (r *Reaper) Clear() int {
 	for id := range r.taskMap {
 		r.removeLocked(id)
 	}
-	r.logger.Debug("Reaper.Clear: removed %d tasks", count)
+	r.logger.Debugf("Reaper.Clear: removed %d tasks", count)
 	return count
 }
 
@@ -313,10 +313,10 @@ func (r *Reaper) loop() {
 				r.mu.Unlock()
 
 				if handler != nil {
-					r.logger.Debug("Reaper.loop: executing handler for expired task %s", task.ID)
+					// r.logger.Debugf("Reaper.loop: executing handler for expired task %s", task.ID)
 					handler(context.Background(), task.ID)
 				} else {
-					r.logger.Warn("Reaper.loop: task %s expired but no handler registered", task.ID)
+					// r.logger.Warn("Reaper.loop: task %s expired but no handler registered", task.ID)
 				}
 
 				// Loop immediately to check for other expired tasks
@@ -331,17 +331,17 @@ func (r *Reaper) loop() {
 		// Set timer
 		if hasTasks {
 			timer.Reset(sleepDuration)
-			r.logger.Debug("Reaper.loop: sleeping for %v until next expiration", sleepDuration)
+			// r.logger.Debugf("Reaper.loop: sleeping for %v until next expiration", sleepDuration)
 		} else {
 			// No tasks, sleep longer
 			timer.Reset(time.Hour)
-			r.logger.Debug("Reaper.loop: no tasks, sleeping for 1 hour")
+			// r.logger.Debugf("Reaper.loop: no tasks, sleeping for 1 hour")
 		}
 
 		select {
 		case <-r.stop:
 			timer.Stop()
-			r.logger.Info("Reaper.loop: received stop signal, exiting")
+			// r.logger.Info("Reaper.loop: received stop signal, exiting")
 			return
 		case <-r.signal:
 			// Task added or updated, check heap again
@@ -352,10 +352,10 @@ func (r *Reaper) loop() {
 				default:
 				}
 			}
-			r.logger.Debug("Reaper.loop: received signal, checking heap again")
+			// r.logger.Debugf("Reaper.loop: received signal, checking heap again")
 		case <-timer.C:
 			// Timer fired, loop again to check heap
-			r.logger.Debug("Reaper.loop: timer fired, checking for expirations")
+			// r.logger.Debugf("Reaper.loop: timer fired, checking for expirations")
 		}
 	}
 }
