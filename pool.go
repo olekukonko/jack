@@ -76,7 +76,6 @@ func NewPool(numWorkers int, opts ...Pooling) *Pool {
 	if numWorkers <= 0 {
 		numWorkers = 1
 	}
-
 	options := poolingOpt{
 		queueSize:       numWorkers * 2,
 		taskIDGenerator: defaultIDTask,
@@ -84,20 +83,17 @@ func NewPool(numWorkers int, opts ...Pooling) *Pool {
 	for _, opt := range opts {
 		opt(&options)
 	}
-
 	p := &Pool{
 		numWorkers: numWorkers,
 		tasks:      make(chan job, options.queueSize),
 		observable: options.observable,
 		opts:       options,
 	}
-
 	if logger != nil {
 		p.logger = logger.Namespace("pool")
 	} else {
 		p.logger = &ll.Logger{}
 	}
-
 	p.shutdownWg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		w := newWorker(i+1, p.tasks, &p.shutdownWg, p.observable)
@@ -137,7 +133,6 @@ func (p *Pool) Submit(ts ...Task) error {
 		return ErrPoolClosed
 	}
 	p.mu.RUnlock()
-
 	for i, t := range ts {
 		if t == nil {
 			if p.logger != nil {
@@ -145,19 +140,16 @@ func (p *Pool) Submit(ts ...Task) error {
 			}
 			return fmt.Errorf("nil task at index %d in batch", i)
 		}
-
 		job := &tasker{
 			task:            t,
 			ctx:             context.Background(),
 			taskIDGenerator: p.opts.taskIDGenerator,
 			defaultIDPrefix: "task",
 		}
-
 		taskID := job.ID()
 		if p.observable != nil {
 			p.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 		}
-
 		select {
 		case p.tasks <- job:
 			if p.logger != nil {
@@ -182,14 +174,12 @@ func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 		return ctx.Err()
 	default:
 	}
-
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
 		return ErrPoolClosed
 	}
 	p.mu.RUnlock()
-
 	for i, t := range ts {
 		if t == nil {
 			if p.logger != nil {
@@ -203,12 +193,10 @@ func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 			taskIDGenerator: p.opts.taskIDGenerator,
 			defaultIDPrefix: "task",
 		}
-
 		taskID := job.ID()
 		if p.observable != nil {
 			p.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 		}
-
 		select {
 		case p.tasks <- job:
 			if p.logger != nil {
@@ -235,14 +223,12 @@ func (p *Pool) Shutdown(timeout time.Duration) error {
 	}
 	p.closed = true
 	p.mu.Unlock()
-
 	if p.logger != nil {
 		p.logger.Info("Pool shutdown started, workers: %d, goroutines: %d", p.numWorkers, runtime.NumGoroutine())
 	}
 	p.quitOnce.Do(func() {
 		close(p.tasks)
 	})
-
 	done := make(chan struct{})
 	go func() {
 		if p.logger != nil {
@@ -254,7 +240,6 @@ func (p *Pool) Shutdown(timeout time.Duration) error {
 		}
 		close(done)
 	}()
-
 	select {
 	case <-done:
 		if p.logger != nil {

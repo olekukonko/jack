@@ -1,17 +1,17 @@
-// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/oklog/ulid/v2"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/oklog/ulid/v2"
 )
 
 // testSimpleTask is a test implementation of the Task interface for pool testing.
@@ -406,13 +406,19 @@ func TestPool_SubmitCtx_TaskRespectsCancellation(t *testing.T) {
 	pool := NewPool(1, PoolingWithObservable(obsable))
 	defer pool.Shutdown(1 * time.Second)
 
-	task := &testCtxTask{id: "ctxCancel", duration: 1 * time.Second}
+	task := &testCtxTask{id: "ctxCancel", duration: 1 * time.Second, runSignal: make(chan struct{})}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
 	err := pool.SubmitCtx(ctx, task)
 	if err != nil {
 		t.Fatalf("SubmitCtx failed: %v", err)
+	}
+
+	select {
+	case <-task.runSignal:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Task did not start within expected time")
 	}
 
 	doneEvent, ok := collector.waitForEvent(t, "ctxCancel", "done", 200*time.Millisecond)
@@ -516,12 +522,11 @@ func TestPool_Shutdown_Timeout(t *testing.T) {
 	pool := NewPool(1, PoolingWithQueueSize(1))
 
 	longTaskDone := make(chan struct{})
-	longTask := Func(func() error {
+	_ = pool.Submit(Func(func() error {
 		defer close(longTaskDone)
 		time.Sleep(200 * time.Millisecond)
 		return nil
-	})
-	pool.Submit(longTask)
+	}))
 
 	time.Sleep(10 * time.Millisecond)
 
