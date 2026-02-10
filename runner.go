@@ -206,26 +206,28 @@ func (r *Runner) process() {
 			r.opts.observable.Notify(Event{Type: "run", WorkerID: runnerWorkerID, TaskID: taskID, Time: time.Now()})
 		}
 		startTime := time.Now()
-		var err error
+		errCh := make(chan error, 1)
 		executeDone := make(chan struct{})
 		go func() {
 			defer func() {
-				if rr := recover(); rr != nil {
-					err = &CaughtPanic{Val: rr, Stack: debug.Stack()}
-					r.logger.Info("PANIC in runner task execution (TaskID %s): %v", taskID, r)
+				if rec := recover(); rec != nil {
+					errCh <- &CaughtPanic{Val: rec, Stack: debug.Stack()}
+					r.logger.Info("PANIC in runner task execution (TaskID %s): %v", taskID, rec)
 				}
 				close(executeDone)
 			}()
-			err = job.Run(originalCtx)
+			errCh <- job.Run(originalCtx)
 		}()
+		var err error
 		select {
 		case <-executeDone:
+			err = <-errCh
 		case <-originalCtx.Done():
+			<-executeDone
+			err = <-errCh
 			if err == nil {
 				err = originalCtx.Err()
 			}
-			// Wait for the goroutine to finish to prevent leak
-			<-executeDone
 		}
 		if r.opts.observable != nil {
 			r.opts.observable.Notify(Event{

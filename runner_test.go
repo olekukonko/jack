@@ -1,15 +1,15 @@
-// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
 	"context"
 	"errors"
-	"github.com/oklog/ulid/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/oklog/ulid/v2"
 )
 
 // TestRunner_NewRunner verifies that NewRunner creates a non-nil Runner instance.
