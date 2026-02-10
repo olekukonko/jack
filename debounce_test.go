@@ -1,5 +1,3 @@
-// debounce_test.go
-
 package jack
 
 import (
@@ -166,25 +164,31 @@ func TestDebounce_Cancel(t *testing.T) {
 }
 
 func TestDebounce_LastFunctionWins(t *testing.T) {
-	var firstFuncCalled, secondFuncCalled bool
+	firstDone := make(chan struct{})
+	secondDone := make(chan struct{})
 
 	debouncer := NewDebouncer(WithDebounceDelay(50 * time.Millisecond))
 
 	debouncer.Do(func() {
-		firstFuncCalled = true
+		close(firstDone)
 	})
 	time.Sleep(10 * time.Millisecond)
 	debouncer.Do(func() {
-		secondFuncCalled = true
+		close(secondDone)
 	})
 
-	time.Sleep(100 * time.Millisecond) // Wait for execution
-
-	if firstFuncCalled {
-		t.Error("First function was called, but should have been overridden")
-	}
-	if !secondFuncCalled {
+	select {
+	case <-secondDone:
+		// Success: second function ran
+	case <-time.After(100 * time.Millisecond):
 		t.Error("Second function was not called")
+	}
+
+	select {
+	case <-firstDone:
+		t.Error("First function was called, but should have been overridden")
+	case <-time.After(10 * time.Millisecond):
+		// Success: first did not run
 	}
 }
 

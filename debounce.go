@@ -15,7 +15,6 @@ const (
 	// NoLimitCalls is the default for maxCalls, meaning no limit on the number of calls before execution.
 	// Set to math.MaxInt to indicate unbounded call accumulation.
 	NoLimitCalls = math.MaxInt
-
 	// NoLimitWait is the default for maxWait, meaning no time limit before forced execution.
 	// Set to time.Duration(math.MaxInt64) to disable the maximum wait enforcement.
 	NoLimitWait = time.Duration(math.MaxInt64)
@@ -53,17 +52,14 @@ func WithDebounceMaxWait(limit time.Duration) DebouncerOption {
 // It uses a mutex for thread-safety and timers for delay and maxWait enforcement.
 // The last provided function in a series of Do calls is the one executed.
 type Debouncer struct {
-	mu    sync.Mutex
-	delay time.Duration
-	timer *time.Timer
-
-	calls    int
-	maxCalls int
-
+	mu           sync.Mutex
+	delay        time.Duration
+	timer        *time.Timer
+	calls        int
+	maxCalls     int
 	startWait    time.Time
 	maxWait      time.Duration
 	maxWaitTimer *time.Timer
-
 	// Stores last function to debounce.
 	fn func()
 }
@@ -76,18 +72,14 @@ func NewDebouncer(options ...DebouncerOption) *Debouncer {
 		maxWait:  NoLimitWait,
 		maxCalls: NoLimitCalls,
 	}
-
 	for _, opt := range options {
 		opt(db)
 	}
-
 	// Initialize timers and immediately stop them to prepare for Reset calls.
 	db.timer = time.AfterFunc(NoLimitWait, db.fire)
 	db.timer.Stop()
-
 	db.maxWaitTimer = time.AfterFunc(NoLimitWait, db.fireMaxWait)
 	db.maxWaitTimer.Stop()
-
 	return db
 }
 
@@ -98,19 +90,19 @@ func NewDebouncer(options ...DebouncerOption) *Debouncer {
 func (d *Debouncer) Do(fn func()) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
 	d.fn = fn
 	if d.calls == 0 {
 		d.startWait = time.Now()
 		if d.maxWait != NoLimitWait {
+			stopAndDrainTimer(d.maxWaitTimer)
 			d.maxWaitTimer.Reset(d.maxWait)
 		}
 	}
 	d.calls++
-
 	if d.callLimitReached() || d.timeLimitReached() {
 		d.flush()
 	} else {
+		stopAndDrainTimer(d.timer)
 		d.timer.Reset(d.delay)
 	}
 }
@@ -121,8 +113,8 @@ func (d *Debouncer) Do(fn func()) {
 func (d *Debouncer) Cancel() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.timer.Stop()
-	d.maxWaitTimer.Stop()
+	stopAndDrainTimer(d.timer)
+	stopAndDrainTimer(d.maxWaitTimer)
 	d.reset()
 }
 
@@ -162,11 +154,10 @@ func (d *Debouncer) flush() {
 	if d.fn == nil {
 		return // Nothing to flush
 	}
-	d.timer.Stop()
-	d.maxWaitTimer.Stop()
+	stopAndDrainTimer(d.timer)
+	stopAndDrainTimer(d.maxWaitTimer)
 	fn := d.fn
 	d.reset()
-
 	// Run the function in a new goroutine to avoid blocking the caller of Do/Flush.
 	go fn()
 }
