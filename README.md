@@ -22,6 +22,9 @@ Ideal for web servers, ETL pipelines, real-time systems, or any app needing reli
 - **Task Types**: Support for `Task` (simple), `TaskCtx` (context-aware), and `Identifiable` (custom IDs).
 - **Error Handling**: Captures panics as `CaughtPanic` errors with optional stack traces.
 - **Logging**: Integrated with a namespaced logger for detailed tracing.
+- **Lifetime Hooks**: Add start/end/timed callbacks to operations for setup/cleanup or timeouts.
+- **Reaper**: Efficient expiration tracking for items (e.g., cache TTL) using min-heap, with handlers on expiry.
+- **Shutdown Manager**: Registers cleanup hooks (funcs, closers) for graceful exit on signals or triggers, with stats.
 
 ## Installation
 ```bash
@@ -190,6 +193,44 @@ obs.Remove(&myObserver{})
 ```
 
 Use with Pool/Scheduler/Runner for task events.
+
+### Lifetime Hooks
+```go
+lifetime := jack.NewLifetime(
+    jack.LifetimeWithStart(func(ctx context.Context, id string) error { /* setup */ return nil }),
+    jack.LifetimeWithEnd(func(ctx context.Context, id string) { /* cleanup */ }),
+    jack.LifetimeWithTimed(func(ctx context.Context, id string) { /* timeout */ }, time.Minute),
+)
+err := lifetime.Execute(ctx, "op1", jack.Func(func() error { /* operation */ return nil }))
+
+// Manager for multiple lifetimes
+lm := jack.NewLifetimeManager()
+defer lm.Stop()
+lm.ExecuteWithLifetime(ctx, "op2", lifetime, jack.Func(func() error { /* ... */ return nil }))
+lm.ResetTimed("op2") // Keep-alive
+```
+
+### Reaper
+```go
+reaper := jack.NewReaper(time.Minute, jack.ReaperWithHandler(func(ctx context.Context, id string) { /* on expire */ }))
+reaper.Start()
+defer reaper.Stop()
+
+reaper.Touch("item1") // Schedule with default TTL
+reaper.TouchAt("item2", time.Now().Add(time.Second*30)) // Custom deadline
+reaper.Remove("item1") // Cancel
+```
+
+### Shutdown Manager
+```go
+shutdown := jack.NewShutdown(jack.ShutdownWithTimeout(time.Second*10), jack.ShutdownConcurrent())
+shutdown.RegisterFunc("cleanup", func() { /* cleanup */ })
+shutdown.RegisterCloser("db", dbCloser)
+shutdown.RegisterWithContext("ctx-task", jack.FuncCtx(func(ctx context.Context) error { /* ... */ return nil }))
+
+stats := shutdown.Wait() // Blocks until signal; returns stats
+fmt.Printf("Completed: %d, Failed: %d\n", stats.CompletedEvents, stats.FailedEvents)
+```
 
 ## API Reference
 - **Types**: `Task`, `TaskCtx`, `Identifiable`, `Event`, `Schedule`, `Routine`, `CaughtPanic`.
