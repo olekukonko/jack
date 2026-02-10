@@ -67,11 +67,9 @@ func NewReaper(ttl time.Duration, opts ...ReaperOption) *Reaper {
 		logger:     logger.Namespace("reaper"),
 	}
 	heap.Init(&r.tasks)
-
 	for _, opt := range opts {
 		opt(r)
 	}
-
 	return r
 }
 
@@ -101,12 +99,9 @@ func (r *Reaper) Touch(id string) {
 	if r.stopped.Load() {
 		return
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	deadline := time.Now().Add(r.defaultTTL)
-
 	if task, exists := r.taskMap[id]; exists {
 		task.Deadline = deadline
 		heap.Fix(&r.tasks, task.index)
@@ -117,7 +112,6 @@ func (r *Reaper) Touch(id string) {
 		r.taskMap[id] = task
 		// r.logger.Debugf("Reaper.Touch: added new task %s with deadline %v", id, deadline)
 	}
-
 	// Non-blocking signal to wake up loop if this new task is sooner
 	r.signalLoop()
 }
@@ -129,10 +123,8 @@ func (r *Reaper) TouchAt(id string, deadline time.Time) {
 	if r.stopped.Load() {
 		return
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	if task, exists := r.taskMap[id]; exists {
 		task.Deadline = deadline
 		heap.Fix(&r.tasks, task.index)
@@ -143,7 +135,6 @@ func (r *Reaper) TouchAt(id string, deadline time.Time) {
 		r.taskMap[id] = task
 		r.logger.Debugf("Reaper.TouchAt: added new task %s with deadline %v", id, deadline)
 	}
-
 	r.signalLoop()
 }
 
@@ -154,10 +145,8 @@ func (r *Reaper) Remove(id string) bool {
 	if r.stopped.Load() {
 		return false
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	removed := r.removeLocked(id)
 	if removed {
 		r.logger.Debugf("Reaper.Remove: removed task %s", id)
@@ -172,10 +161,8 @@ func (r *Reaper) Clear() int {
 	if r.stopped.Load() {
 		return 0
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	count := len(r.taskMap)
 	for id := range r.taskMap {
 		r.removeLocked(id)
@@ -190,7 +177,6 @@ func (r *Reaper) Count() int {
 	if r.stopped.Load() {
 		return 0
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.taskMap)
@@ -203,10 +189,8 @@ func (r *Reaper) Deadline() (time.Time, bool) {
 	if r.stopped.Load() {
 		return time.Time{}, false
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	if r.tasks.Len() > 0 {
 		return r.tasks[0].Deadline, true
 	}
@@ -220,60 +204,15 @@ func (r *Reaper) Stop() {
 	if !r.stopped.CompareAndSwap(false, true) {
 		return
 	}
-
 	r.logger.Info("Reaper.Stop: initiating shutdown")
 	close(r.stop)
 	r.wg.Wait()
-
 	// Clear maps after stopping to free memory
 	r.mu.Lock()
 	r.taskMap = nil
 	r.tasks = nil
 	r.mu.Unlock()
-
 	r.logger.Info("Reaper.Stop: shutdown complete")
-}
-
-type reaperHeap []*ReaperTask
-
-func (h reaperHeap) Len() int { return len(h) }
-
-func (h reaperHeap) Less(i, j int) bool {
-	// Handle zero times (shouldn't happen, but be defensive)
-	if h[i].Deadline.IsZero() {
-		return true
-	}
-	if h[j].Deadline.IsZero() {
-		return false
-	}
-	return h[i].Deadline.Before(h[j].Deadline)
-}
-
-func (h reaperHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].index = i
-	h[j].index = j
-}
-
-func (h *reaperHeap) Push(x interface{}) {
-	n := len(*h)
-	item := x.(*ReaperTask)
-	item.index = n
-	*h = append(*h, item)
-}
-
-func (h *reaperHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	if n == 0 {
-		return nil
-	}
-	item := old[n-1]
-	// Avoid memory leak
-	old[n-1] = nil
-	*h = old[0 : n-1]
-	item.index = -1 // Mark as removed
-	return item
 }
 
 // signalLoop sends a non-blocking signal to wake up the loop
@@ -289,69 +228,55 @@ func (r *Reaper) signalLoop() {
 func (r *Reaper) loop() {
 	defer r.wg.Done()
 	r.logger.Info("Reaper.loop: starting background expiration loop")
-
 	timer := time.NewTimer(0) // Initially expired to check heap
 	<-timer.C                 // Drain initial tick
-
 	for {
 		var sleepDuration time.Duration
 		var hasTasks bool
-
 		r.mu.Lock()
 		if r.tasks.Len() > 0 {
 			hasTasks = true
 			now := time.Now()
 			earliest := r.tasks[0]
-
 			if earliest.Deadline.Before(now) || earliest.Deadline.Equal(now) {
 				// Expired! Pop and execute.
 				task := heap.Pop(&r.tasks).(*ReaperTask)
 				delete(r.taskMap, task.ID)
-
 				// Capture handler locally to run outside lock
 				handler := r.handler
 				r.mu.Unlock()
-
 				if handler != nil {
 					// r.logger.Debugf("Reaper.loop: executing handler for expired task %s", task.ID)
 					handler(context.Background(), task.ID)
 				} else {
 					// r.logger.Warn("Reaper.loop: task %s expired but no handler registered", task.ID)
 				}
-
 				// Loop immediately to check for other expired tasks
 				continue
 			}
-
 			// Not expired yet
 			sleepDuration = earliest.Deadline.Sub(now)
 		}
 		r.mu.Unlock()
-
 		// Set timer
 		if hasTasks {
+			stopAndDrainTimer(timer)
 			timer.Reset(sleepDuration)
 			// r.logger.Debugf("Reaper.loop: sleeping for %v until next expiration", sleepDuration)
 		} else {
 			// No tasks, sleep longer
+			stopAndDrainTimer(timer)
 			timer.Reset(time.Hour)
 			// r.logger.Debugf("Reaper.loop: no tasks, sleeping for 1 hour")
 		}
-
 		select {
 		case <-r.stop:
-			timer.Stop()
+			stopAndDrainTimer(timer)
 			// r.logger.Info("Reaper.loop: received stop signal, exiting")
 			return
 		case <-r.signal:
 			// Task added or updated, check heap again
-			if !timer.Stop() {
-				// Drain timer channel if it fired
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			stopAndDrainTimer(timer)
 			// r.logger.Debugf("Reaper.loop: received signal, checking heap again")
 		case <-timer.C:
 			// Timer fired, loop again to check heap
@@ -368,4 +293,42 @@ func (r *Reaper) removeLocked(id string) bool {
 		return true
 	}
 	return false
+}
+
+type reaperHeap []*ReaperTask
+
+func (h reaperHeap) Len() int { return len(h) }
+func (h reaperHeap) Less(i, j int) bool {
+	// Handle zero times (shouldn't happen, but be defensive)
+	if h[i].Deadline.IsZero() {
+		return true
+	}
+	if h[j].Deadline.IsZero() {
+		return false
+	}
+	return h[i].Deadline.Before(h[j].Deadline)
+}
+func (h reaperHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+func (h *reaperHeap) Push(x interface{}) {
+	n := len(*h)
+	item := x.(*ReaperTask)
+	item.index = n
+	*h = append(*h, item)
+}
+func (h *reaperHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	if n == 0 {
+		return nil
+	}
+	item := old[n-1]
+	// Avoid memory leak
+	old[n-1] = nil
+	*h = old[0 : n-1]
+	item.index = -1 // Mark as removed
+	return item
 }

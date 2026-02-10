@@ -369,13 +369,13 @@ func TestReaperHeapOrdering(t *testing.T) {
 }
 
 func TestReaperHandlerContext(t *testing.T) {
-	var handlerCtx context.Context
-	var handlerLid string
+	handlerCtxCh := make(chan context.Context, 1)
+	handlerLidCh := make(chan string, 1)
 
 	r := NewReaper(50 * time.Millisecond)
 	r.Register(func(ctx context.Context, id string) {
-		handlerCtx = ctx
-		handlerLid = id
+		handlerCtxCh <- ctx
+		handlerLidCh <- id
 	})
 	r.Start()
 	defer r.Stop()
@@ -386,11 +386,22 @@ func TestReaperHandlerContext(t *testing.T) {
 	// Wait for expiration
 	time.Sleep(100 * time.Millisecond)
 
-	if handlerCtx == nil {
-		t.Error("Handler should receive a context")
+	select {
+	case handlerCtx := <-handlerCtxCh:
+		if handlerCtx == nil {
+			t.Error("Handler should receive a context")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Timeout waiting for handler to execute")
 	}
-	if handlerLid != expectedLid {
-		t.Errorf("Handler received lid = %v, want %v", handlerLid, expectedLid)
+
+	select {
+	case handlerLid := <-handlerLidCh:
+		if handlerLid != expectedLid {
+			t.Errorf("Handler received lid = %v, want %v", handlerLid, expectedLid)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Timeout waiting for handler to execute")
 	}
 }
 

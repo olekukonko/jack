@@ -1,13 +1,14 @@
 package jack
 
 import (
-	"context"
 	"fmt"
-	"github.com/oklog/ulid/v2"
-	"github.com/olekukonko/ll"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/oklog/ulid/v2"
+	"github.com/olekukonko/ll"
 )
 
 // worker processes jobs from a task channel in a worker pool.
@@ -25,7 +26,7 @@ type worker struct {
 // It initializes a logger with a worker-specific namespace or a dummy logger if none is available.
 // Example:
 //
-//	w := newWorker(1, taskChan, wg, obs) // Creates worker with ID 1
+// w := newWorker(1, taskChan, wg, obs) // Creates worker with ID 1
 func newWorker(id int, taskChan <-chan job, wg *sync.WaitGroup, obs Observable[Event]) *worker {
 	var workerLogger *ll.Logger
 	if logger != nil {
@@ -33,7 +34,6 @@ func newWorker(id int, taskChan <-chan job, wg *sync.WaitGroup, obs Observable[E
 	} else {
 		workerLogger = &ll.Logger{}
 	}
-
 	return &worker{
 		id:         id,
 		taskChan:   taskChan,
@@ -49,7 +49,7 @@ func newWorker(id int, taskChan <-chan job, wg *sync.WaitGroup, obs Observable[E
 // Thread-safe via goroutine and channel operations.
 // Example:
 //
-//	w.start() // Starts worker to process jobs
+// w.start() // Starts worker to process jobs
 func (w *worker) start() {
 	go func() {
 		defer func() {
@@ -58,12 +58,10 @@ func (w *worker) start() {
 				w.logger.Info("Worker %d wait group done, goroutines: %d", w.id, runtime.NumGoroutine())
 			}
 		}()
-
 		workerIDStr := fmt.Sprintf("worker-%d", w.id)
 		if w.logger != nil {
 			w.logger.Info("Worker %d starting, goroutines: %d", w.id, runtime.NumGoroutine())
 		}
-
 		for {
 			select {
 			case job, ok := <-w.taskChan:
@@ -86,38 +84,36 @@ func (w *worker) start() {
 						w.logger.Info("Worker %d assigned ID %s to job with empty taskID", w.id, taskID)
 					}
 				}
-
 				originalCtx := job.Context()
-
 				if w.observable != nil {
 					w.observable.Notify(Event{Type: "run", WorkerID: workerIDStr, TaskID: taskID, Time: time.Now()})
 				}
-
 				startTime := time.Now()
-				var err error
-
+				errCh := make(chan error, 1)
 				executeDone := make(chan struct{})
 				go func() {
 					defer func() {
 						if r := recover(); r != nil {
-							err = &CaughtPanic{Val: r, Stack: []byte("stack trace unavailable in simplified example")}
+							errCh <- &CaughtPanic{Val: r, Stack: debug.Stack()}
 							if w.logger != nil {
 								w.logger.Info("PANIC in task execution (Worker %d, TaskID %s): %v", w.id, taskID, r)
 							}
 						}
 						close(executeDone)
 					}()
-					err = job.Run(context.Background())
+					errCh <- job.Run(originalCtx)
 				}()
-
+				var err error
 				select {
 				case <-executeDone:
+					err = <-errCh
 				case <-originalCtx.Done():
+					<-executeDone
+					err = <-errCh
 					if err == nil {
 						err = originalCtx.Err()
 					}
 				}
-
 				if w.observable != nil {
 					w.observable.Notify(Event{
 						Type:     "done",
@@ -138,7 +134,7 @@ func (w *worker) start() {
 // Thread-safe as it updates the logger pointer.
 // Example:
 //
-//	w.Logger(extLogger) // Sets logger for worker
+// w.Logger(extLogger) // Sets logger for worker
 func (w *worker) Logger(extLogger *ll.Logger) *worker {
 	if extLogger != nil {
 		w.logger = extLogger.Namespace(fmt.Sprintf("worker-%d", w.id))
