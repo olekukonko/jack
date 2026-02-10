@@ -5,7 +5,7 @@ import "context"
 // Func converts a function returning an error into a Task.
 // Example:
 //
-//	pool.Submit(jack.Func(func() error { return nil })) // Submits a simple task
+// pool.Submit(jack.Func(func() error { return nil })) // Submits a simple task
 type Func func() error
 
 // Do executes the function to satisfy the Task interface.
@@ -14,7 +14,7 @@ func (f Func) Do() error { return f() }
 // FuncCtx converts a context-aware function into a TaskCtx.
 // Example:
 //
-//	pool.SubmitCtx(ctx, jack.FuncCtx(func(ctx context.Context) error { return nil })) // Submits a context-aware task
+// pool.SubmitCtx(ctx, jack.FuncCtx(func(ctx context.Context) error { return nil })) // Submits a context-aware task
 type FuncCtx func(ctx context.Context) error
 
 // Do executes the function with the given context to satisfy the TaskCtx interface.
@@ -55,7 +55,6 @@ func (cg *Caller) Run() error {
 			return err
 		}
 	}
-
 	return err
 }
 

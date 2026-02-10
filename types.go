@@ -1,4 +1,3 @@
-// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -106,7 +105,6 @@ type Routine struct {
 // Package jack provides utilities for safe, context-aware function execution with mutex protection.
 // It includes methods to execute functions with panic recovery, context cancellation support,
 // and mutex locking, eliminating the need for verbose boilerplate when handling timeouts or cancellations.
-
 // CaughtPanic represents a panic that was caught during execution.
 type CaughtPanic struct {
 	Val   interface{} // The value passed to panic()
@@ -140,7 +138,7 @@ func (c *CaughtPanic) Unwrap() error {
 // Example:
 //
 //	pool.Submit(jack.Do(func() {
-//	    fmt.Println("Hello from task")
+//		fmt.Println("Hello from task")
 //	}))
 func Do(fn func()) Task {
 	return Func(func() error {
@@ -155,7 +153,7 @@ func Do(fn func()) Task {
 // Example:
 //
 //	pool.SubmitCtx(ctx, jack.DoCtx(func(ctx context.Context) {
-//	    fmt.Println("Running with context:", ctx)
+//		fmt.Println("Running with context:", ctx)
 //	}))
 func DoCtx(fn func(ctx context.Context)) TaskCtx {
 	return FuncCtx(func(ctx context.Context) error {

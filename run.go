@@ -1,4 +1,3 @@
-// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
@@ -71,7 +70,6 @@ func (g *Group) doWork(job func() error) {
 		g.sem <- struct{}{}
 		defer func() { <-g.sem }()
 	}
-
 	var errToSend error
 	defer func() {
 		if errToSend != nil {
@@ -84,7 +82,6 @@ func (g *Group) doWork(job func() error) {
 			}
 		}
 	}()
-
 	func() {
 		defer func() {
 			if v := recover(); v != nil {
@@ -125,7 +122,6 @@ func (g *Group) GoCtx(f func(context.Context) error) {
 	if g.ctx == nil {
 		panic("jack.Group: must use WithContext before GoCtx")
 	}
-
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
@@ -135,7 +131,6 @@ func (g *Group) GoCtx(f func(context.Context) error) {
 			}
 			return f(g.ctx)
 		}
-
 		if g.sem != nil {
 			g.sem <- struct{}{}
 			defer func() { <-g.sem }()
@@ -161,7 +156,6 @@ func (g *Group) GoCtx(f func(context.Context) error) {
 				return
 			}
 		}
-
 		g.doWork(job)
 	}()
 }

@@ -18,8 +18,8 @@ type Safely struct {
 //
 //	var mu Safely
 //	mu.Do(func() {
-//	    // Critical section
-//	    fmt.Println("Safe execution")
+//		// Critical section
+//		fmt.Println("Safe execution")
 //	})
 func (m *Safely) Do(fn func()) {
 	m.Lock()
@@ -39,9 +39,9 @@ func (m *Safely) Do(fn func()) {
 //	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 //	defer cancel()
 //	err := mu.DoCtx(ctx, func() error {
-//	    // Critical section, no need to check ctx
-//	    time.Sleep(100 * time.Millisecond)
-//	    return nil
+//		// Critical section, no need to check ctx
+//		time.Sleep(100 * time.Millisecond)
+//		return nil
 //	})
 //	// err will likely be context.DeadlineExceeded due to timeout
 func (m *Safely) DoCtx(ctx context.Context, fn func() error) error {
@@ -58,11 +58,11 @@ func (m *Safely) DoCtx(ctx context.Context, fn func() error) error {
 //
 //	var mu Safely
 //	err := mu.Safe(func() error {
-//	    // Critical section
-//	    return nil
+//		// Critical section
+//		return nil
 //	})
 //	if err != nil {
-//	    fmt.Println("Error:", err)
+//		fmt.Println("Error:", err)
 //	}
 func (m *Safely) Safe(fn func() error) error {
 	m.Lock()
@@ -81,9 +81,9 @@ func (m *Safely) Safe(fn func() error) error {
 //	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 //	defer cancel()
 //	err := mu.SafeCtx(ctx, func() error {
-//	    // Critical section, no need to check ctx
-//	    time.Sleep(100 * time.Millisecond)
-//	    return nil
+//		// Critical section, no need to check ctx
+//		time.Sleep(100 * time.Millisecond)
+//		return nil
 //	})
 //	// err will likely be context.DeadlineExceeded due to timeout
 func (m *Safely) SafeCtx(ctx context.Context, fn func() error) error {
@@ -112,11 +112,11 @@ func safe(fn func() error, captureStack bool) (err error) {
 // Example:
 //
 //	err := Safe(func() error {
-//	    // May panic or return an error
-//	    return nil
+//		// May panic or return an error
+//		return nil
 //	})
 //	if cp, ok := err.(*CaughtPanic); ok {
-//	    fmt.Printf("Caught panic: %v\nStack: %s\n", cp.Val, cp.Stack)
+//		fmt.Printf("Caught panic: %v\nStack: %s\n", cp.Val, cp.Stack)
 //	}
 func Safe(fn func() error) error {
 	return safe(fn, true)
@@ -131,9 +131,9 @@ func Safe(fn func() error) error {
 //	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 //	defer cancel()
 //	err := SafeCtx(ctx, func() error {
-//	    // No need to check ctx
-//	    time.Sleep(100 * time.Millisecond)
-//	    return nil
+//		// No need to check ctx
+//		time.Sleep(100 * time.Millisecond)
+//		return nil
 //	})
 //	// err will likely be context.DeadlineExceeded due to timeout
 func SafeCtx(ctx context.Context, fn func() error) error {
@@ -163,11 +163,11 @@ func safeCtx(ctx context.Context, fn func() error, captureStack bool) (err error
 // Example:
 //
 //	err := SafeNoStack(func() error {
-//	    panic("error")
-//	    return nil
+//		panic("error")
+//		return nil
 //	})
 //	if cp, ok := err.(*CaughtPanic); ok {
-//	    fmt.Printf("Caught panic: %v, Stack: %v\n", cp.Val, cp.Stack == nil)
+//		fmt.Printf("Caught panic: %v, Stack: %v\n", cp.Val, cp.Stack == nil)
 //	}
 func SafeNoStack(fn func() error) error {
 	return safe(fn, false)
@@ -182,9 +182,9 @@ func SafeNoStack(fn func() error) error {
 //	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 //	defer cancel()
 //	err := SafeCtxNoStack(ctx, func() error {
-//	    // No need to check ctx
-//	    time.Sleep(100 * time.Millisecond)
-//	    return nil
+//		// No need to check ctx
+//		time.Sleep(100 * time.Millisecond)
+//		return nil
 //	})
 //	// err will likely be context.DeadlineExceeded due to timeout
 func SafeCtxNoStack(ctx context.Context, fn func() error) error {

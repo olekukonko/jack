@@ -3,8 +3,10 @@ package jack
 import (
 	"context"
 	"errors"
-	"github.com/oklog/ulid/v2"
+
 	"strings"
+
+	"github.com/oklog/ulid/v2"
 )
 
 // tasker wraps a Task or TaskCtx with a context and ID generation logic.

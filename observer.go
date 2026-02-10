@@ -1,8 +1,9 @@
 package jack
 
 import (
-	"github.com/olekukonko/ll"
 	"sync"
+
+	"github.com/olekukonko/ll"
 )
 
 // Observer defines the interface for objects that wish to receive notifications from an Observable.
@@ -12,7 +13,7 @@ import (
 //
 //	type LogObserver struct {}
 //	func (l *LogObserver) OnNotify(event string) {
-//	    fmt.Printf("Received event: %s\n", event)
+//		fmt.Printf("Received event: %s\n", event)
 //	}
 type Observer[T any] interface {
 	OnNotify(value T) // Called when an event of type T is received
@@ -86,20 +87,17 @@ func NewObservable[T any](numNotifyWorkers ...int) Observable[T] {
 	if len(numNotifyWorkers) > 0 && numNotifyWorkers[0] > 0 {
 		workers = numNotifyWorkers[0] // Use provided worker count if valid
 	}
-
 	// Initialize observable with job channel and shutdown channel
 	obs := &eventObservable[T]{
 		jobs:       make(chan notificationJob[T], workers*10), // Buffer size scales with workers
 		shutdownCh: make(chan struct{}),
 		numWorkers: workers,
 	}
-
 	// Start worker goroutines to process notifications
 	obs.workerWg.Add(workers)
 	for i := 0; i < workers; i++ {
 		go obs.process() // Launch worker goroutine
 	}
-
 	// Initialize logger with observable namespace
 	obs.logger = logger.Namespace("observable")
 	return obs
@@ -143,7 +141,6 @@ func (o *eventObservable[T]) process() {
 func (o *eventObservable[T]) Add(observers ...Observer[T]) {
 	o.mutex.Lock() // Acquire write lock for thread-safety
 	defer o.mutex.Unlock()
-
 	for _, observer := range observers {
 		o.observers = append(o.observers, observer) // Append each observer to the list
 	}
@@ -164,13 +161,11 @@ func (o *eventObservable[T]) Add(observers ...Observer[T]) {
 func (o *eventObservable[T]) Remove(observers ...Observer[T]) {
 	o.mutex.Lock() // Acquire write lock for thread-safety
 	defer o.mutex.Unlock()
-
 	// Create a map to mark observers for removal
 	toRemove := make(map[Observer[T]]struct{}, len(observers))
 	for _, obs := range observers {
 		toRemove[obs] = struct{}{}
 	}
-
 	// Rebuild observer list excluding removed observers
 	newObservers := make([]Observer[T], 0, len(o.observers))
 	for _, obs := range o.observers {
@@ -197,7 +192,6 @@ func (o *eventObservable[T]) Notify(events ...T) {
 	currentObservers := make([]Observer[T], len(o.observers))
 	copy(currentObservers, o.observers)
 	o.mutex.RUnlock()
-
 	// Queue notification jobs for each event and observer
 	for _, event := range events {
 		for _, observer := range currentObservers {
@@ -230,6 +224,5 @@ func (o *eventObservable[T]) Shutdown() {
 	}
 	close(o.shutdownCh) // Signal workers to stop
 	o.mutex.Unlock()
-
 	o.workerWg.Wait() // Wait for all workers to complete
 }

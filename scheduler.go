@@ -84,7 +84,6 @@ func NewScheduler(name string, pool *Pool, schedule Routine, opts ...Cycle) (*Sc
 	if pool == nil {
 		return nil, ErrSchedulerPoolNil // Return error if task pool is nil
 	}
-
 	// Initialize default configuration for retries
 	config := Scheduling{
 		RetryCount:   retryScheduler,        // Default to 3 retry attempts for failed submissions
@@ -94,11 +93,9 @@ func NewScheduler(name string, pool *Pool, schedule Routine, opts ...Cycle) (*Sc
 	for _, opt := range opts {
 		opt(&config)
 	}
-
 	// Set up logger with scheduler-specific namespace for contextual logging
 	lo := logger.Namespace("scheduler")
 	pool.Logger(lo) // Configure pool to use the same logger
-
 	// Return initialized scheduler instance
 	return &Scheduler{
 		name:    name,
@@ -116,7 +113,6 @@ func (s *Scheduler) loop(runnerCtx context.Context, taskToRun interface{}, perEx
 	defer s.runnerWg.Done()                    // Decrement WaitGroup when loop exits
 	taskTypeName := typeName(taskToRun)        // Get task type for logging and events
 	taskRefID := defaultIDScheduler(taskToRun) // Get unique task ID
-
 	// Handle immediate first run if interval is set
 	if s.routine.Interval > 0 {
 		if _, submitted := s.submit(taskToRun, perExecutionCtx); submitted {
@@ -125,12 +121,10 @@ func (s *Scheduler) loop(runnerCtx context.Context, taskToRun interface{}, perEx
 			s.emit("task_submission_failed", taskRefID, taskTypeName, time.Now(), "Failed to submit first immediate task", nil)
 		}
 	}
-
 	runsCounter := 1 // Account for immediate run
 	if s.routine.Interval <= 0 {
 		runsCounter = 0 // No immediate run for non-interval tasks
 	}
-
 	// Handle non-interval-based execution (run a fixed number of times)
 	if s.routine.Interval <= 0 {
 		maxRuns := s.routine.MaxRuns
@@ -148,17 +142,14 @@ func (s *Scheduler) loop(runnerCtx context.Context, taskToRun interface{}, perEx
 		s.emit("run_limit_reached", taskRefID, taskTypeName, time.Now(), fmt.Sprintf("Max %d non-interval runs completed", maxRuns), nil)
 		return
 	}
-
 	// Handle interval-based execution (run periodically)
 	ticker := time.NewTicker(s.routine.Interval) // Create ticker for periodic execution
 	defer ticker.Stop()                          // Ensure ticker is stopped when loop exits
-
 	for {
 		if s.routine.MaxRuns > 0 && runsCounter >= s.routine.MaxRuns {
 			s.emit("run_limit_reached", taskRefID, taskTypeName, time.Now(), fmt.Sprintf("Max %d interval runs completed", s.routine.MaxRuns), nil)
 			return // Exit if max runs reached
 		}
-
 		select {
 		case tickTime := <-ticker.C:
 			if _, submitted := s.submit(taskToRun, perExecutionCtx); submitted {
@@ -184,19 +175,16 @@ func (s *Scheduler) Do(ts ...Task) error {
 		s.mu.Unlock()
 		return ErrSchedulerJobAlreadyRunning // Prevent starting if already running
 	}
-
 	// Initialize active tasks list with provided tasks
 	s.activeTasks = make([]interface{}, len(ts))
 	for i, t := range ts {
 		s.activeTasks[i] = t
 	}
-
 	// Create a context for controlling the scheduler loop lifecycle
 	runnerCtx, cancel := context.WithCancel(context.Background())
 	s.runnerCancelFn = cancel
 	s.running = true // Mark scheduler as running
 	s.mu.Unlock()
-
 	// Increment WaitGroup for each task to track active goroutines
 	s.runnerWg.Add(len(s.activeTasks))
 	for _, task := range s.activeTasks {
@@ -205,7 +193,6 @@ func (s *Scheduler) Do(ts ...Task) error {
 		// Start a goroutine to handle task scheduling loop
 		go s.loop(runnerCtx, task, nil)
 	}
-
 	return nil // Successful start
 }
 
@@ -219,25 +206,21 @@ func (s *Scheduler) DoCtx(taskExecCtx context.Context, ts ...TaskCtx) error {
 		s.mu.Unlock()
 		return ErrSchedulerJobAlreadyRunning // Prevent starting if already running
 	}
-
 	// Use background context if none provided
 	if taskExecCtx == nil {
 		taskExecCtx = context.Background()
 	}
-
 	// Initialize active tasks list with provided tasks
 	s.activeTasks = make([]interface{}, len(ts))
 	for i, t := range ts {
 		s.activeTasks[i] = t
 	}
 	s.taskRunCtx = taskExecCtx // Store task execution context
-
 	// Create a context for controlling the scheduler loop lifecycle
 	runnerCtx, cancel := context.WithCancel(context.Background())
 	s.runnerCancelFn = cancel
 	s.running = true // Mark scheduler as running
 	s.mu.Unlock()
-
 	// Increment WaitGroup for each task to track active goroutines
 	s.runnerWg.Add(len(s.activeTasks))
 	for _, task := range s.activeTasks {
@@ -246,7 +229,6 @@ func (s *Scheduler) DoCtx(taskExecCtx context.Context, ts ...TaskCtx) error {
 		// Start a goroutine to handle task scheduling loop with execution context
 		go s.loop(runnerCtx, task, s.taskRunCtx)
 	}
-
 	return nil // Successful start
 }
 
@@ -259,27 +241,22 @@ func (s *Scheduler) Terminate(cancelPool bool) error {
 		s.mu.Unlock()
 		return ErrSchedulerNotRunning // Return error if scheduler is not active
 	}
-
 	// Cancel the scheduler loop context if it exists
 	if s.runnerCancelFn != nil {
 		s.runnerCancelFn()
 	}
 	tasksToStop := s.activeTasks // Capture tasks to emit stop events
 	s.mu.Unlock()
-
 	// Wait for all task loops to complete
 	s.runnerWg.Wait()
-
 	s.mu.Lock()
 	s.running = false   // Mark scheduler as stopped
 	s.activeTasks = nil // Clear active tasks
 	s.mu.Unlock()
-
 	// Optionally shut down the task pool
 	if cancelPool {
 		s.pool.Shutdown(time.Second * 5) // Allow 5 seconds for pool shutdown
 	}
-
 	// Emit stop events for each task
 	for _, task := range tasksToStop {
 		s.emit("stopped", defaultIDScheduler(task), typeName(task), time.Now(), "Scheduler job explicitly stopped.", nil)
@@ -299,13 +276,11 @@ func (s *Scheduler) Stop() error {
 func (s *Scheduler) submit(taskToRun interface{}, perExecutionCtx context.Context) (string, bool) {
 	taskReferenceID := defaultIDScheduler(taskToRun) // Get task ID
 	taskTypeName := typeName(taskToRun)              // Get task type name
-
 	// Check if pool is valid
 	if s.pool == nil {
 		s.logger.Info("Scheduler [%s]: Pool is nil.", s.name)
 		return taskReferenceID, false // Return failure if pool is nil
 	}
-
 	var err error
 	// Recover from panics during submission to prevent crashes
 	defer func() {
@@ -316,7 +291,6 @@ func (s *Scheduler) submit(taskToRun interface{}, perExecutionCtx context.Contex
 			s.logger.Info("Scheduler [%s]: Failed to submit task %s: %v", s.name, taskTypeName, err)
 		}
 	}()
-
 	// Handle task submission based on task type
 	switch task := taskToRun.(type) {
 	case Task:
