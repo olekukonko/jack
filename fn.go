@@ -1,10 +1,11 @@
-// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
-	"github.com/oklog/ulid/v2"
 	"reflect"
 	"strings"
+	"time"
+
+	"github.com/oklog/ulid/v2"
 )
 
 // defaultIDRunner generates a unique ID for a runner task.
@@ -50,17 +51,13 @@ func typeName(v interface{}) string {
 	if t == nil {
 		return "nil"
 	}
-
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-
 	if name := t.Name(); name != "" && !strings.Contains(name, "[") {
 		return name
 	}
-
 	typeStr := t.String()
-
 	if bracketStart := strings.Index(typeStr, "["); bracketStart > 0 {
 		bracketEnd := strings.LastIndex(typeStr, "]")
 		if bracketEnd > bracketStart {
@@ -72,11 +69,20 @@ func typeName(v interface{}) string {
 			return innerType
 		}
 	}
-
 	parts := strings.Split(typeStr, ".")
 	lastPart := parts[len(parts)-1]
 	if idx := strings.IndexAny(lastPart, "[]"); idx != -1 {
 		lastPart = lastPart[:idx]
 	}
 	return lastPart
+}
+
+// stopAndDrainTimer safely stops a timer and drains its channel if necessary.
+func stopAndDrainTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
 }

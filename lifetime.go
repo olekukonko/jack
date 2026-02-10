@@ -22,11 +22,9 @@ type Lifetime struct {
 	// Start runs before the operation begins.
 	// If it returns an error, the operation is aborted.
 	Start LifetimeHook
-
 	// End runs after the operation completes successfully.
 	// No error return - matches zevent.Runner.End exactly.
 	End LifetimeCallback
-
 	// Timed runs after a specific duration if not cancelled/reset.
 	// Used for inactivity/TTL logic. No error return.
 	Timed     LifetimeCallback
@@ -76,17 +74,14 @@ func (l *Lifetime) Execute(ctx context.Context, id string, operation Func) error
 			return err
 		}
 	}
-
 	// Execute the operation
 	if err := operation(); err != nil {
 		return err
 	}
-
 	// Run End hook (no error return - matches zevent)
 	if l.End != nil {
 		l.End(ctx, id)
 	}
-
 	return nil
 }
 
@@ -99,17 +94,14 @@ func (l *Lifetime) ExecuteCtx(ctx context.Context, id string, operation FuncCtx)
 			return err
 		}
 	}
-
 	// Execute the operation
 	if err := operation(ctx); err != nil {
 		return err
 	}
-
 	// Run End hook (no error return - matches zevent)
 	if l.End != nil {
 		l.End(ctx, id)
 	}
-
 	return nil
 }
 
@@ -120,7 +112,6 @@ type LifetimeManager struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
-
 	// Configuration
 	defaultWait  time.Duration
 	defaultTimer time.Duration
@@ -177,11 +168,9 @@ func NewLifetimeManager(opts ...LifetimeManagerOption) *LifetimeManager {
 		defaultTimer: 1 * time.Minute,
 		logger:       logger.Namespace("lifetime"),
 	}
-
 	for _, opt := range opts {
 		opt(lm)
 	}
-
 	return lm
 }
 
@@ -194,9 +183,11 @@ func (lm *LifetimeManager) ScheduleTimed(ctx context.Context, id string, callbac
 		lm.logger.Debug("ScheduleTimed: nil callback for ID %s", id)
 		return
 	}
-
 	lm.timersMu.Lock()
-
+	defer lm.timersMu.Unlock()
+	if lm.ctx.Err() != nil {
+		return // Manager is stopping, do not schedule new
+	}
 	// Stop existing timer if any
 	if existing, ok := lm.timers[id]; ok {
 		if !existing.timer.Stop() {
@@ -208,40 +199,30 @@ func (lm *LifetimeManager) ScheduleTimed(ctx context.Context, id string, callbac
 		}
 		delete(lm.timers, id)
 	}
-
 	// Create new timer
 	timer := time.NewTimer(wait)
-
 	lm.timers[id] = &activeLifetime{
 		timer:    timer,
 		callback: callback,
 		duration: wait,
 		id:       id,
 	}
-
-	lm.timersMu.Unlock()
-
-	lm.logger.Debug("ScheduleTimed: scheduled callback for ID %s in %v", id, wait)
-
-	// Start goroutine to handle the timer
 	lm.wg.Add(1)
+	lm.logger.Debug("ScheduleTimed: scheduled callback for ID %s in %v", id, wait)
+	// Start goroutine to handle the timer
 	go func() {
 		defer lm.wg.Done()
-
 		select {
 		case <-timer.C:
 			// Timer fired, execute callback
 			lm.timersMu.Lock()
 			delete(lm.timers, id)
 			lm.timersMu.Unlock()
-
 			lm.logger.Debug("ScheduleTimed: executing callback for ID %s", id)
-
 			// Execute callback with timeout
 			bgCtx, cancel := context.WithTimeout(context.Background(), lm.defaultTimer)
 			defer cancel()
 			callback(bgCtx, id)
-
 		case <-lm.ctx.Done():
 			// Manager stopped, clean up
 			timer.Stop()
@@ -257,7 +238,6 @@ func (lm *LifetimeManager) ScheduleLifetimeTimed(ctx context.Context, id string,
 		lm.ResetTimed(id)
 		return
 	}
-
 	lm.ScheduleTimed(ctx, id, lifetime.Timed, lifetime.TimedWait)
 }
 
@@ -267,15 +247,12 @@ func (lm *LifetimeManager) ExecuteWithLifetime(ctx context.Context, id string, l
 	if lifetime == nil {
 		return operation()
 	}
-
 	// Execute with hooks
 	err := lifetime.Execute(ctx, id, operation)
-
 	// If successful and we have a Timed callback, schedule it
 	if err == nil && lifetime.Timed != nil {
 		lm.ScheduleLifetimeTimed(ctx, id, lifetime)
 	}
-
 	return err
 }
 
@@ -285,15 +262,12 @@ func (lm *LifetimeManager) ExecuteCtxWithLifetime(ctx context.Context, id string
 	if lifetime == nil {
 		return operation(ctx)
 	}
-
 	// Execute with hooks
 	err := lifetime.ExecuteCtx(ctx, id, operation)
-
 	// If successful and we have a Timed callback, schedule it
 	if err == nil && lifetime.Timed != nil {
 		lm.ScheduleLifetimeTimed(ctx, id, lifetime)
 	}
-
 	return err
 }
 
@@ -301,7 +275,6 @@ func (lm *LifetimeManager) ExecuteCtxWithLifetime(ctx context.Context, id string
 func (lm *LifetimeManager) ResetTimed(id string) bool {
 	lm.timersMu.Lock()
 	defer lm.timersMu.Unlock()
-
 	if timer, exists := lm.timers[id]; exists {
 		// Stop the timer first
 		if !timer.timer.Stop() {
@@ -310,13 +283,11 @@ func (lm *LifetimeManager) ResetTimed(id string) bool {
 			lm.logger.Debug("ResetTimed: timer already fired for ID %s", id)
 			return false
 		}
-
 		// Reset the timer
 		timer.timer.Reset(timer.duration)
 		lm.logger.Debug("ResetTimed: reset timer for ID %s", id)
 		return true
 	}
-
 	lm.logger.Debug("ResetTimed: no timer found for ID %s", id)
 	return false
 }
@@ -325,14 +296,12 @@ func (lm *LifetimeManager) ResetTimed(id string) bool {
 func (lm *LifetimeManager) CancelTimed(id string) bool {
 	lm.timersMu.Lock()
 	defer lm.timersMu.Unlock()
-
 	if timer, ok := lm.timers[id]; ok {
 		timer.timer.Stop()
 		delete(lm.timers, id)
 		lm.logger.Debug("CancelTimed: cancelled timer for ID %s", id)
 		return true
 	}
-
 	lm.logger.Debug("CancelTimed: no timer found for ID %s", id)
 	return false
 }
@@ -340,10 +309,8 @@ func (lm *LifetimeManager) CancelTimed(id string) bool {
 // StopAll cancels all pending timed callbacks and waits for them to complete.
 func (lm *LifetimeManager) StopAll() {
 	lm.logger.Info("StopAll: stopping all timers")
-
 	// Cancel context to signal all goroutines
 	lm.cancel()
-
 	// Stop all timers
 	lm.timersMu.Lock()
 	for id, timer := range lm.timers {
@@ -351,10 +318,8 @@ func (lm *LifetimeManager) StopAll() {
 		delete(lm.timers, id)
 	}
 	lm.timersMu.Unlock()
-
 	// Wait for all goroutines to complete
 	lm.wg.Wait()
-
 	lm.logger.Info("StopAll: all timers stopped")
 }
 
@@ -379,11 +344,9 @@ func (lm *LifetimeManager) GetRemainingDuration(id string) (time.Duration, bool)
 	lm.timersMu.RLock()
 	timer, exists := lm.timers[id]
 	lm.timersMu.RUnlock()
-
 	if !exists || timer == nil {
 		return 0, false
 	}
-
 	return timer.duration, true
 }
 
@@ -392,14 +355,14 @@ func (lm *LifetimeManager) Stop() {
 	lm.StopAll()
 }
 
-// RunWithLifetime is a convenience function that creates and executes a lifetime.
-func RunWithLifetime(ctx context.Context, id string, operation Func, opts ...LifetimeOption) error {
+// LifetimeWithRun is a convenience function that creates and executes a lifetime.
+func LifetimeWithRun(ctx context.Context, id string, operation Func, opts ...LifetimeOption) error {
 	lifetime := NewLifetime(opts...)
 	return lifetime.Execute(ctx, id, operation)
 }
 
-// RunCtxWithLifetime is a convenience function for context-aware operations.
-func RunCtxWithLifetime(ctx context.Context, id string, operation FuncCtx, opts ...LifetimeOption) error {
+// LifetimeWithRunCtx is a convenience function for context-aware operations.
+func LifetimeWithRunCtx(ctx context.Context, id string, operation FuncCtx, opts ...LifetimeOption) error {
 	lifetime := NewLifetime(opts...)
 	return lifetime.ExecuteCtx(ctx, id, operation)
 }
