@@ -1,9 +1,9 @@
-// Package jack manages a worker pool for concurrent task execution with logging and observability.
 package jack
 
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -80,15 +80,12 @@ func NewRunner(opts ...RunnerOption) *Runner {
 	for _, opt := range opts {
 		opt(&options)
 	}
-
 	r := &Runner{
 		tasks: make(chan job, options.queueSize),
 		opts:  options,
 	}
-
 	r.shutdownWg.Add(1)
 	go r.process()
-
 	if logger != nil {
 		r.logger = logger.Namespace("runner")
 	} else {
@@ -105,9 +102,7 @@ func (r *Runner) submit(submitCtx context.Context, job job) error {
 		r.logger.Info("nil job rejected")
 		return errors.New("nil job")
 	}
-
 	taskID := job.ID()
-
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
@@ -122,9 +117,7 @@ func (r *Runner) submit(submitCtx context.Context, job job) error {
 		return ErrRunnerClosed
 	}
 	r.mu.RUnlock()
-
 	r.logger.Debugf("attempting to submit job %s (queue len %d)", taskID, len(r.tasks))
-
 	if submitCtx != nil {
 		select {
 		case r.tasks <- job:
@@ -206,39 +199,34 @@ func (r *Runner) process() {
 			r.logger.Info("Runner received nil job, skipping")
 			continue
 		}
-
 		taskID := job.ID()
 		r.logger.Info("Runner processing job: type=%T, taskID=%s", job, taskID)
-
 		originalCtx := job.Context()
-
 		if r.opts.observable != nil {
 			r.opts.observable.Notify(Event{Type: "run", WorkerID: runnerWorkerID, TaskID: taskID, Time: time.Now()})
 		}
-
 		startTime := time.Now()
 		var err error
-
 		executeDone := make(chan struct{})
 		go func() {
 			defer func() {
-				if rec := recover(); rec != nil {
-					err = &CaughtPanic{Val: rec, Stack: []byte("stack trace unavailable in simplified example")}
-					r.logger.Info("PANIC in runner task execution (TaskID %s): %v", taskID, rec)
+				if rr := recover(); rr != nil {
+					err = &CaughtPanic{Val: rr, Stack: debug.Stack()}
+					r.logger.Info("PANIC in runner task execution (TaskID %s): %v", taskID, r)
 				}
 				close(executeDone)
 			}()
-			err = job.Run(context.Background())
+			err = job.Run(originalCtx)
 		}()
-
 		select {
 		case <-executeDone:
 		case <-originalCtx.Done():
 			if err == nil {
 				err = originalCtx.Err()
 			}
+			// Wait for the goroutine to finish to prevent leak
+			<-executeDone
 		}
-
 		if r.opts.observable != nil {
 			r.opts.observable.Notify(Event{
 				Type:     "done",
@@ -266,17 +254,14 @@ func (r *Runner) Shutdown(timeout time.Duration) error {
 	}
 	r.closed = true
 	r.mu.Unlock()
-
 	r.quitOnce.Do(func() {
 		close(r.tasks)
 	})
-
 	done := make(chan struct{})
 	go func() {
 		r.shutdownWg.Wait()
 		close(done)
 	}()
-
 	select {
 	case <-done:
 		return nil

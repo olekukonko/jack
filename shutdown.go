@@ -64,27 +64,22 @@ func ShutdownWithLogger(l *ll.Logger) ShutdownOption {
 
 // Shutdown manages the graceful shutdown process.
 type Shutdown struct {
-	mu sync.RWMutex
-
+	mu         sync.RWMutex
 	signalChan chan os.Signal
 	doneChan   chan struct{}
 	forceQuit  chan struct{}
-
 	// events stores the callbacks. We wrap everything into namedCall
 	// to normalize execution logic.
-	events []namedCall
-
+	events      []namedCall
 	inShutdown  atomic.Bool
 	shutdownCtx context.Context
 	cancelFunc  context.CancelFunc
-
 	// Configuration
 	timeout          time.Duration
 	concurrent       bool
 	signals          []os.Signal
 	forceQuitTimeout time.Duration
 	logger           *ll.Logger
-
 	// Statistics
 	statsMu sync.RWMutex
 	stats   *ShutdownStats
@@ -123,36 +118,29 @@ func NewShutdown(opts ...ShutdownOption) *Shutdown {
 			Errors: make([]error, 0),
 		},
 	}
-
 	// Apply logger default (can be overridden by opts)
 	if logger != nil {
 		sm.logger = logger.Namespace("shutdown")
 	} else {
 		sm.logger = &ll.Logger{}
 	}
-
 	// Apply options
 	for _, opt := range opts {
 		opt(sm)
 	}
-
 	// Setup Signals
 	sm.signalChan = make(chan os.Signal, 1)
 	signal.Notify(sm.signalChan, sm.signals...)
-
 	// Setup Context
 	// We only apply the timeout during the actual shutdown phase.
 	ctx, cancel := context.WithCancel(context.Background())
-
 	sm.shutdownCtx = ctx
 	sm.cancelFunc = cancel
-
 	// Setup Force Quit Monitor
 	if sm.forceQuitTimeout > 0 {
 		sm.forceQuit = make(chan struct{}, 1)
 		go sm.forceQuitMonitor(sm.forceQuitTimeout)
 	}
-
 	return sm
 }
 
@@ -167,7 +155,6 @@ func (sm *Shutdown) forceQuitMonitor(timeout time.Duration) {
 	case <-time.After(timeout):
 		sm.log("force quit timeout (%v) reached — cancelling context", timeout)
 		sm.cancelFunc()
-
 		// Signal the Wait loop if it's blocking
 		if sm.forceQuit != nil {
 			select {
@@ -180,16 +167,15 @@ func (sm *Shutdown) forceQuitMonitor(timeout time.Duration) {
 
 // Register adds a cleanup task.
 // Supported types:
-// - func(), func() error, func(context.Context) error, io.Closer
+//   - func(), func() error, func(context.Context) error, io.Closer
+//
 // Automatically wraps panics into structured errors and tracks stats.
 func (sm *Shutdown) Register(fn any) error {
 	if fn == nil {
 		return errors.New("cannot register nil")
 	}
-
 	var name string
 	var call FuncCtx
-
 	switch f := fn.(type) {
 	case func():
 		name = autoName(f)
@@ -221,7 +207,6 @@ func (sm *Shutdown) Register(fn any) error {
 	default:
 		return fmt.Errorf("unsupported callback type: %T", fn)
 	}
-
 	return sm.registerCall(name, call)
 }
 
@@ -266,14 +251,11 @@ func (sm *Shutdown) registerCall(name string, fn FuncCtx) error {
 			name = "anonymous"
 		}
 	}
-
 	if sm.IsShuttingDown() {
 		return errors.New("cannot register after shutdown started")
 	}
-
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
 	// Wrap user function to handle panics safely
 	wrapped := func(ctx context.Context) (err error) {
 		defer func() {
@@ -286,7 +268,6 @@ func (sm *Shutdown) registerCall(name string, fn FuncCtx) error {
 				sm.log("PANIC recovered in task '%s': %v", name, r)
 			}
 		}()
-
 		if callErr := fn(ctx); callErr != nil {
 			return &ShutdownError{
 				Name:      name,
@@ -296,13 +277,10 @@ func (sm *Shutdown) registerCall(name string, fn FuncCtx) error {
 		}
 		return nil
 	}
-
 	sm.events = append(sm.events, namedCall{Name: name, Fn: wrapped})
-
 	sm.statsMu.Lock()
 	sm.stats.TotalEvents++
 	sm.statsMu.Unlock()
-
 	return nil
 }
 
@@ -314,7 +292,6 @@ func (sm *Shutdown) Wait() *ShutdownStats {
 		<-sm.doneChan
 		return sm.GetStats()
 	}
-
 	select {
 	case sig := <-sm.signalChan:
 		sm.log("received signal: %v", sig)
@@ -323,7 +300,6 @@ func (sm *Shutdown) Wait() *ShutdownStats {
 	case <-sm.shutdownCtx.Done():
 		sm.log("shutdown context cancelled (timeout or manual)")
 	}
-
 	return sm.executeShutdown()
 }
 
@@ -362,25 +338,20 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 		<-sm.doneChan
 		return sm.GetStats()
 	}
-
 	sm.mu.Lock()
 	events := sm.events
 	sm.events = nil // Clear to prevent double execution
 	sm.mu.Unlock()
-
 	sm.statsMu.Lock()
 	sm.stats.StartTime = time.Now()
 	sm.stats.TotalEvents = len(events)
 	sm.statsMu.Unlock()
-
 	sm.log("starting shutdown of %d task(s)", len(events))
-
 	// Crucially, use sm.shutdownCtx as the parent.
 	// This ensures that if ForceQuitMonitor calls sm.cancelFunc(),
 	// this context (and the tasks using it) are cancelled immediately.
 	var cleanupCtx context.Context
 	var cleanupCancel context.CancelFunc
-
 	if sm.timeout > 0 {
 		// Apply the timeout NOW, relative to when shutdown started
 		cleanupCtx, cleanupCancel = context.WithTimeout(sm.shutdownCtx, sm.timeout)
@@ -388,7 +359,6 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 		cleanupCtx, cleanupCancel = context.WithCancel(sm.shutdownCtx)
 	}
 	defer cleanupCancel()
-
 	if len(events) > 0 {
 		if sm.concurrent {
 			sm.executeConcurrent(events, cleanupCtx) // Pass cleanupCtx
@@ -396,18 +366,14 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 			sm.executeSequential(events, cleanupCtx) // Pass cleanupCtx
 		}
 	}
-
 	sm.statsMu.Lock()
 	sm.stats.EndTime = time.Now()
 	sm.statsMu.Unlock()
-
 	duration := sm.stats.EndTime.Sub(sm.stats.StartTime)
 	sm.log("shutdown completed in %v (failed: %d)", duration, sm.stats.FailedEvents)
-
 	sm.cancelFunc()
 	close(sm.doneChan)
 	signal.Stop(sm.signalChan)
-
 	return sm.GetStats()
 }
 
@@ -419,7 +385,6 @@ func (sm *Shutdown) executeSequential(events []namedCall, ctx context.Context) {
 	for i := len(events) - 1; i >= 0; i-- {
 		nc := events[i]
 		sm.log("running: %s", nc.Name)
-
 		if err := nc.Fn(ctx); err != nil {
 			sm.log("task failed: %s -> %v", nc.Name, err)
 			sm.recordError(err)
@@ -440,7 +405,6 @@ func (sm *Shutdown) executeSequential(events []namedCall, ctx context.Context) {
 func (sm *Shutdown) executeConcurrent(events []namedCall, ctx context.Context) {
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(events))
-
 	for _, nc := range events {
 		wg.Add(1)
 		go func(task namedCall) {
@@ -449,24 +413,22 @@ func (sm *Shutdown) executeConcurrent(events []namedCall, ctx context.Context) {
 			errChan <- task.Fn(ctx)
 		}(nc)
 	}
-
 	go func() {
 		wg.Wait()
 		close(errChan)
 	}()
-
 	failed := 0
 	for err := range errChan {
 		if err != nil {
 			failed++
 			sm.recordError(err)
 			// Try to log the name if it's our wrapped error type
-			if se, ok := err.(*ShutdownError); ok {
+			var se *ShutdownError
+			if errors.As(err, &se) {
 				sm.log("task failed (concurrent): %s -> %v", se.Name, se.Err)
 			}
 		}
 	}
-
 	sm.statsMu.Lock()
 	sm.stats.FailedEvents += failed
 	sm.stats.CompletedEvents += len(events) - failed
@@ -505,7 +467,6 @@ func (sm *Shutdown) recordError(err error) {
 func (sm *Shutdown) GetStats() *ShutdownStats {
 	sm.statsMu.RLock()
 	defer sm.statsMu.RUnlock()
-
 	copyx := *sm.stats
 	if sm.stats.Errors != nil {
 		copyx.Errors = make([]error, len(sm.stats.Errors))
@@ -547,8 +508,5 @@ func autoName(fn any) string {
 			return name
 		}
 	}
-	if name := fmt.Sprintf("anon-%s", ulid.Make().String()); name != "" {
-		return name
-	}
-	return "anonymous"
+	return fmt.Sprintf("anon-%s", ulid.Make().String())
 }
