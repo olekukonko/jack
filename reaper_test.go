@@ -425,7 +425,7 @@ func TestReaperWithOptions(t *testing.T) {
 
 func TestReaperLogger(t *testing.T) {
 	// Test that logger can be set via option
-	logger := ll.New("test-reaper")
+	logger := ll.New("test-reaper").Disable()
 	r := NewReaper(1*time.Second, ReaperWithLogger(logger))
 
 	if r == nil {

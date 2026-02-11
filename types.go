@@ -44,7 +44,7 @@ var (
 )
 
 // logger is the default logger for the jack package, initialized with the "jack" namespace.
-var logger = ll.New("jack")
+var logger = ll.New("jack").Disable()
 
 // Identifiable is an optional interface for tasks to provide a custom ID for logging, metrics, and tracing.
 type Identifiable interface {
