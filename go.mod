@@ -4,7 +4,7 @@ go 1.23
 
 require (
 	github.com/oklog/ulid/v2 v2.1.1
-	github.com/olekukonko/ll v0.1.5
+	github.com/olekukonko/ll v0.1.6
 )
 
 require (
