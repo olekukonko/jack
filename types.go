@@ -107,16 +107,16 @@ type Routine struct {
 // and mutex locking, eliminating the need for verbose boilerplate when handling timeouts or cancellations.
 // CaughtPanic represents a panic that was caught during execution.
 type CaughtPanic struct {
-	Val   interface{} // The value passed to panic()
+	Value interface{} // The value passed to panic()
 	Stack []byte      // The stack trace (may be empty if not collected)
 }
 
 // Error implements the error interface.
 func (c *CaughtPanic) Error() string {
 	if c.Stack != nil {
-		return fmt.Sprintf("panic: %v\nstack:\n%s", c.Val, c.Stack)
+		return fmt.Sprintf("panic: %v\nstack:\n%s", c.Value, c.Stack)
 	}
-	return fmt.Sprintf("panic: %v", c.Val)
+	return fmt.Sprintf("panic: %v", c.Value)
 }
 
 // String provides a formatted string representation of the panic.
@@ -126,7 +126,7 @@ func (c *CaughtPanic) String() string {
 
 // Unwrap provides compatibility with errors.Is/As.
 func (c *CaughtPanic) Unwrap() error {
-	if err, ok := c.Val.(error); ok {
+	if err, ok := c.Value.(error); ok {
 		return err
 	}
 	return nil

@@ -301,8 +301,8 @@ func TestPool_Submit_TaskWithPanic(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected error to be CaughtPanic, got %T", doneEvent.Err)
 	}
-	if caughtPanic.Val != "oh no!" {
-		t.Errorf("Unexpected panic value: %v", caughtPanic.Val)
+	if caughtPanic.Value != "oh no!" {
+		t.Errorf("Unexpected panic value: %v", caughtPanic.Value)
 	}
 }
 

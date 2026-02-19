@@ -211,7 +211,7 @@ func (r *Runner) process() {
 		go func() {
 			defer func() {
 				if rec := recover(); rec != nil {
-					errCh <- &CaughtPanic{Val: rec, Stack: debug.Stack()}
+					errCh <- &CaughtPanic{Value: rec, Stack: debug.Stack()}
 					r.logger.Info("PANIC in runner task execution (TaskID %s): %v", taskID, rec)
 				}
 				close(executeDone)

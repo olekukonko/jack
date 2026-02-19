@@ -94,7 +94,7 @@ func (w *worker) start() {
 				go func() {
 					defer func() {
 						if r := recover(); r != nil {
-							errCh <- &CaughtPanic{Val: r, Stack: debug.Stack()}
+							errCh <- &CaughtPanic{Value: r, Stack: debug.Stack()}
 							if w.logger != nil {
 								w.logger.Info("PANIC in task execution (Worker %d, TaskID %s): %v", w.id, taskID, r)
 							}

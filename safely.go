@@ -96,7 +96,7 @@ func (m *Safely) SafeCtx(ctx context.Context, fn func() error) error {
 func safe(fn func() error, captureStack bool) (err error) {
 	defer func() {
 		if v := recover(); v != nil {
-			cp := &CaughtPanic{Val: v}
+			cp := &CaughtPanic{Value: v}
 			if captureStack {
 				cp.Stack = debug.Stack()
 			}
@@ -116,7 +116,7 @@ func safe(fn func() error, captureStack bool) (err error) {
 //		return nil
 //	})
 //	if cp, ok := err.(*CaughtPanic); ok {
-//		fmt.Printf("Caught panic: %v\nStack: %s\n", cp.Val, cp.Stack)
+//		fmt.Printf("Caught panic: %v\nStack: %s\n", cp.Value, cp.Stack)
 //	}
 func Safe(fn func() error) error {
 	return safe(fn, true)
@@ -167,7 +167,7 @@ func safeCtx(ctx context.Context, fn func() error, captureStack bool) (err error
 //		return nil
 //	})
 //	if cp, ok := err.(*CaughtPanic); ok {
-//		fmt.Printf("Caught panic: %v, Stack: %v\n", cp.Val, cp.Stack == nil)
+//		fmt.Printf("Caught panic: %v, Stack: %v\n", cp.Value, cp.Stack == nil)
 //	}
 func SafeNoStack(fn func() error) error {
 	return safe(fn, false)

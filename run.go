@@ -86,7 +86,7 @@ func (g *Group) doWork(job func() error) {
 		defer func() {
 			if v := recover(); v != nil {
 				errToSend = &CaughtPanic{
-					Val:   v,
+					Value: v,
 					Stack: debug.Stack(),
 				}
 			}
@@ -207,7 +207,7 @@ func Go(f func() error) <-chan error {
 			defer func() {
 				if v := recover(); v != nil {
 					errToSend = &CaughtPanic{
-						Val:   v,
+						Value: v,
 						Stack: debug.Stack(),
 					}
 				}

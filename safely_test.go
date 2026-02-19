@@ -86,8 +86,8 @@ func TestSafely(t *testing.T) {
 
 		// Test nil fn
 		err = mu.DoCtx(context.Background(), nil)
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val == nil {
-			t.Errorf("DoCtx: expected *CaughtPanic with non-nil Val for nil fn, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value == nil {
+			t.Errorf("DoCtx: expected *CaughtPanic with non-nil Value for nil fn, got %v", err)
 		}
 
 		// Test nil ctx
@@ -110,14 +110,14 @@ func TestSafely(t *testing.T) {
 
 		// Test panic recovery
 		err = mu.Safe(func() error { panic("test panic") })
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val != "test panic" || len(cp.Stack) == 0 {
-			t.Errorf("Safe: expected *CaughtPanic with Val='test panic' and non-empty stack, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value != "test panic" || len(cp.Stack) == 0 {
+			t.Errorf("Safe: expected *CaughtPanic with Value='test panic' and non-empty stack, got %v", err)
 		}
 
 		// Test nil fn
 		err = mu.Safe(nil)
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val == nil {
-			t.Errorf("Safe: expected *CaughtPanic with non-nil Val for nil fn, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value == nil {
+			t.Errorf("Safe: expected *CaughtPanic with non-nil Value for nil fn, got %v", err)
 		}
 	})
 
@@ -143,14 +143,14 @@ func TestSafely(t *testing.T) {
 
 		// Test panic recovery
 		err = mu.SafeCtx(context.Background(), func() error { panic("test panic") })
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val != "test panic" || len(cp.Stack) == 0 {
-			t.Errorf("SafeCtx: expected *CaughtPanic with Val='test panic' and non-empty stack, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value != "test panic" || len(cp.Stack) == 0 {
+			t.Errorf("SafeCtx: expected *CaughtPanic with Value='test panic' and non-empty stack, got %v", err)
 		}
 
 		// Test nil fn
 		err = mu.SafeCtx(context.Background(), nil)
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val == nil {
-			t.Errorf("SafeCtx: expected *CaughtPanic with non-nil Val for nil fn, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value == nil {
+			t.Errorf("SafeCtx: expected *CaughtPanic with non-nil Value for nil fn, got %v", err)
 		}
 
 		// Test nil ctx
@@ -174,14 +174,14 @@ func TestStandalone(t *testing.T) {
 
 		// Test panic recovery
 		err = Safe(func() error { panic("test panic") })
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val != "test panic" || len(cp.Stack) == 0 {
-			t.Errorf("Safe: expected *CaughtPanic with Val='test panic' and non-empty stack, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value != "test panic" || len(cp.Stack) == 0 {
+			t.Errorf("Safe: expected *CaughtPanic with Value='test panic' and non-empty stack, got %v", err)
 		}
 
 		// Test nil fn
 		err = Safe(nil)
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val == nil {
-			t.Errorf("Safe: expected *CaughtPanic with non-nil Val for nil fn, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value == nil {
+			t.Errorf("Safe: expected *CaughtPanic with non-nil Value for nil fn, got %v", err)
 		}
 	})
 
@@ -205,14 +205,14 @@ func TestStandalone(t *testing.T) {
 
 		// Test panic recovery
 		err = SafeCtx(context.Background(), func() error { panic("test panic") })
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val != "test panic" || len(cp.Stack) == 0 {
-			t.Errorf("SafeCtx: expected *CaughtPanic with Val='test panic' and non-empty stack, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value != "test panic" || len(cp.Stack) == 0 {
+			t.Errorf("SafeCtx: expected *CaughtPanic with Value='test panic' and non-empty stack, got %v", err)
 		}
 
 		// Test nil fn
 		err = SafeCtx(context.Background(), nil)
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val == nil {
-			t.Errorf("SafeCtx: expected *CaughtPanic with non-nil Val for nil fn, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value == nil {
+			t.Errorf("SafeCtx: expected *CaughtPanic with non-nil Value for nil fn, got %v", err)
 		}
 
 		// Test nil ctx
@@ -233,14 +233,14 @@ func TestStandalone(t *testing.T) {
 
 		// Test panic recovery
 		err = SafeNoStack(func() error { panic("test panic") })
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val != "test panic" || len(cp.Stack) != 0 {
-			t.Errorf("SafeNoStack: expected *CaughtPanic with Val='test panic' and empty stack, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value != "test panic" || len(cp.Stack) != 0 {
+			t.Errorf("SafeNoStack: expected *CaughtPanic with Value='test panic' and empty stack, got %v", err)
 		}
 
 		// Test nil fn
 		err = SafeNoStack(nil)
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val == nil {
-			t.Errorf("SafeNoStack: expected *CaughtPanic with non-nil Val for nil fn, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value == nil {
+			t.Errorf("SafeNoStack: expected *CaughtPanic with non-nil Value for nil fn, got %v", err)
 		}
 	})
 
@@ -264,14 +264,14 @@ func TestStandalone(t *testing.T) {
 
 		// Test panic recovery
 		err = SafeCtxNoStack(context.Background(), func() error { panic("test panic") })
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val != "test panic" || len(cp.Stack) != 0 {
-			t.Errorf("SafeCtxNoStack: expected *CaughtPanic with Val='test panic' and empty stack, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value != "test panic" || len(cp.Stack) != 0 {
+			t.Errorf("SafeCtxNoStack: expected *CaughtPanic with Value='test panic' and empty stack, got %v", err)
 		}
 
 		// Test nil fn
 		err = SafeCtxNoStack(context.Background(), nil)
-		if cp, ok := err.(*CaughtPanic); !ok || cp.Val == nil {
-			t.Errorf("SafeCtxNoStack: expected *CaughtPanic with non-nil Val for nil fn, got %v", err)
+		if cp, ok := err.(*CaughtPanic); !ok || cp.Value == nil {
+			t.Errorf("SafeCtxNoStack: expected *CaughtPanic with non-nil Value for nil fn, got %v", err)
 		}
 
 		// Test nil ctx
@@ -287,13 +287,13 @@ func TestStandalone(t *testing.T) {
 // TestCaughtPanic tests the CaughtPanic type's methods.
 func TestCaughtPanic(t *testing.T) {
 	t.Run("Error", func(t *testing.T) {
-		cp := &CaughtPanic{Val: "test panic", Stack: []byte("stack trace")}
+		cp := &CaughtPanic{Value: "test panic", Stack: []byte("stack trace")}
 		errStr := cp.Error()
 		if !strings.Contains(errStr, "panic: test panic") || !strings.Contains(errStr, "stack trace") {
 			t.Errorf("CaughtPanic.Error: expected 'panic: test panic' and stack, got %s", errStr)
 		}
 
-		cp = &CaughtPanic{Val: "test panic"}
+		cp = &CaughtPanic{Value: "test panic"}
 		errStr = cp.Error()
 		if errStr != "panic: test panic" {
 			t.Errorf("CaughtPanic.Error: expected 'panic: test panic', got %s", errStr)
@@ -301,7 +301,7 @@ func TestCaughtPanic(t *testing.T) {
 	})
 
 	t.Run("String", func(t *testing.T) {
-		cp := &CaughtPanic{Val: "test panic", Stack: []byte("stack trace")}
+		cp := &CaughtPanic{Value: "test panic", Stack: []byte("stack trace")}
 		str := cp.String()
 		if !strings.Contains(str, "panic: test panic") || !strings.Contains(str, "stack trace") {
 			t.Errorf("CaughtPanic.String: expected 'panic: test panic' and stack, got %s", str)
@@ -309,15 +309,15 @@ func TestCaughtPanic(t *testing.T) {
 	})
 
 	t.Run("Unwrap", func(t *testing.T) {
-		// Test with error as Val
+		// Test with error as Value
 		innerErr := fmt.Errorf("inner error")
-		cp := &CaughtPanic{Val: innerErr}
+		cp := &CaughtPanic{Value: innerErr}
 		if unwrapped := cp.Unwrap(); unwrapped != innerErr {
 			t.Errorf("CaughtPanic.Unwrap: expected %v, got %v", innerErr, unwrapped)
 		}
 
-		// Test with non-error Val
-		cp = &CaughtPanic{Val: "not an error"}
+		// Test with non-error Value
+		cp = &CaughtPanic{Value: "not an error"}
 		if unwrapped := cp.Unwrap(); unwrapped != nil {
 			t.Errorf("CaughtPanic.Unwrap: expected nil, got %v", unwrapped)
 		}
