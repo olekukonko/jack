@@ -1,7 +1,9 @@
 package jack
 
 import (
+	"container/heap"
 	"context"
+	"hash/fnv"
 	"sync"
 	"time"
 
@@ -9,15 +11,12 @@ import (
 )
 
 // LifetimeHook defines a lifecycle hook function that can return an error.
-// Used for Start hook only (matching zevent.Runner.Start).
 type LifetimeHook func(ctx context.Context, id string) error
 
 // LifetimeCallback defines a callback function without error return.
-// Used for End and Timed hooks (matching zevent.Runner.End/Timed).
 type LifetimeCallback func(ctx context.Context, id string)
 
-// Lifetime defines lifecycle hooks for an operation, matching zevent.Runner exactly.
-// No error propagation from End hook - 100% matches original zevent behavior.
+// Lifetime defines lifecycle hooks for an operation matching zevent.Runner behavior.
 type Lifetime struct {
 	// Start runs before the operation begins.
 	// If it returns an error, the operation is aborted.
@@ -36,16 +35,12 @@ type LifetimeOption func(*Lifetime)
 
 // LifetimeWithStart sets the Start hook.
 func LifetimeWithStart(hook LifetimeHook) LifetimeOption {
-	return func(l *Lifetime) {
-		l.Start = hook
-	}
+	return func(l *Lifetime) { l.Start = hook }
 }
 
 // LifetimeWithEnd sets the End hook.
 func LifetimeWithEnd(callback LifetimeCallback) LifetimeOption {
-	return func(l *Lifetime) {
-		l.End = callback
-	}
+	return func(l *Lifetime) { l.End = callback }
 }
 
 // LifetimeWithTimed sets the Timed hook and wait duration.
@@ -66,19 +61,15 @@ func NewLifetime(opts ...LifetimeOption) *Lifetime {
 }
 
 // Execute runs the operation with the lifetime's hooks.
-// 100% matches zevent.Runner.Execute behavior.
 func (l *Lifetime) Execute(ctx context.Context, id string, operation Func) error {
-	// Run Start hook
 	if l.Start != nil {
 		if err := l.Start(ctx, id); err != nil {
 			return err
 		}
 	}
-	// Execute the operation
 	if err := operation(); err != nil {
 		return err
 	}
-	// Run End hook (no error return - matches zevent)
 	if l.End != nil {
 		l.End(ctx, id)
 	}
@@ -86,63 +77,114 @@ func (l *Lifetime) Execute(ctx context.Context, id string, operation Func) error
 }
 
 // ExecuteCtx runs a context-aware operation with the lifetime's hooks.
-// Jack extension - not in original zevent.
 func (l *Lifetime) ExecuteCtx(ctx context.Context, id string, operation FuncCtx) error {
-	// Run Start hook
 	if l.Start != nil {
 		if err := l.Start(ctx, id); err != nil {
 			return err
 		}
 	}
-	// Execute the operation
 	if err := operation(ctx); err != nil {
 		return err
 	}
-	// Run End hook (no error return - matches zevent)
 	if l.End != nil {
 		l.End(ctx, id)
 	}
 	return nil
 }
 
-// LifetimeManager manages multiple lifetimes and their timed events.
-type LifetimeManager struct {
-	timers   map[string]*activeLifetime
-	timersMu sync.RWMutex
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	// Configuration
-	defaultWait  time.Duration
-	defaultTimer time.Duration
-	logger       *ll.Logger
+// scheduledItem tracks expiration metadata for a single timed callback.
+type scheduledItem struct {
+	callback  LifetimeCallback
+	expiresAt time.Time
+	duration  time.Duration
+	id        string
+	index     int
 }
 
-// activeLifetime represents a pending timed callback.
-type activeLifetime struct {
-	timer    *time.Timer
-	callback LifetimeCallback
-	duration time.Duration
-	id       string
+// shard represents a single shard of the lifetime manager with its own priority queue.
+type shard struct {
+	items  map[string]*scheduledItem
+	pq     *priorityQueue
+	mu     sync.Mutex
+	wakeCh chan struct{}
+}
+
+// priorityQueue implements heap.Interface for efficient expiration tracking.
+type priorityQueue []*scheduledItem
+
+// Len returns the number of items in the queue.
+func (pq priorityQueue) Len() int { return len(pq) }
+
+// Less compares expiration times for heap ordering.
+func (pq priorityQueue) Less(i, j int) bool {
+	return pq[i].expiresAt.Before(pq[j].expiresAt)
+}
+
+// Swap exchanges two items and updates their indices.
+func (pq priorityQueue) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+	pq[i].index = i
+	pq[j].index = j
+}
+
+// Push adds an item to the queue.
+func (pq *priorityQueue) Push(x interface{}) {
+	n := len(*pq)
+	item := x.(*scheduledItem)
+	item.index = n
+	*pq = append(*pq, item)
+}
+
+// Pop removes and returns the next item from the queue.
+func (pq *priorityQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	item.index = -1
+	*pq = old[0 : n-1]
+	return item
+}
+
+// LifetimeManager manages lifetimes using sharded priority queues.
+// Scales horizontally with configurable shard count to minimize lock contention.
+type LifetimeManager struct {
+	shards     []*shard
+	shardCount uint32
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	minTick    time.Duration
+	timerLimit time.Duration
+	logger     *ll.Logger
 }
 
 // LifetimeManagerOption configures a LifetimeManager.
 type LifetimeManagerOption func(*LifetimeManager)
 
-// LifetimeManagerWithDefaultWait sets the default wait duration for timed callbacks.
-func LifetimeManagerWithDefaultWait(wait time.Duration) LifetimeManagerOption {
+// LifetimeManagerWithShards sets number of shards (must be power of 2, default 16).
+func LifetimeManagerWithShards(count uint32) LifetimeManagerOption {
 	return func(lm *LifetimeManager) {
-		if wait > 0 {
-			lm.defaultWait = wait
+		if count >= 1 && (count&(count-1)) == 0 {
+			lm.shardCount = count
 		}
 	}
 }
 
-// LifetimeManagerWithDefaultTimer sets the default timer duration for callbacks.
-func LifetimeManagerWithDefaultTimer(timeout time.Duration) LifetimeManagerOption {
+// LifetimeManagerWithMinTick sets minimum sleep between prune checks (default 10ms).
+func LifetimeManagerWithMinTick(tick time.Duration) LifetimeManagerOption {
 	return func(lm *LifetimeManager) {
-		if timeout > 0 {
-			lm.defaultTimer = timeout
+		if tick > 0 {
+			lm.minTick = tick
+		}
+	}
+}
+
+// LifetimeManagerWithTimerLimit sets callback execution timeout (default 1m).
+func LifetimeManagerWithTimerLimit(limit time.Duration) LifetimeManagerOption {
+	return func(lm *LifetimeManager) {
+		if limit > 0 {
+			lm.timerLimit = limit
 		}
 	}
 }
@@ -156,85 +198,154 @@ func LifetimeManagerWithLogger(l *ll.Logger) LifetimeManagerOption {
 	}
 }
 
-// NewLifetimeManager creates a new LifetimeManager.
-// Defaults: 30min wait, 1min timer timeout.
+// NewLifetimeManager creates a new sharded LifetimeManager.
 func NewLifetimeManager(opts ...LifetimeManagerOption) *LifetimeManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	lm := &LifetimeManager{
-		timers:       make(map[string]*activeLifetime),
-		ctx:          ctx,
-		cancel:       cancel,
-		defaultWait:  30 * time.Minute,
-		defaultTimer: 1 * time.Minute,
-		logger:       logger.Namespace("lifetime"),
+		shardCount: 16,
+		ctx:        ctx,
+		cancel:     cancel,
+		minTick:    10 * time.Millisecond,
+		timerLimit: 1 * time.Minute,
+		logger:     logger.Namespace("lifetime"),
 	}
 	for _, opt := range opts {
 		opt(lm)
 	}
+	lm.shards = make([]*shard, lm.shardCount)
+	for i := uint32(0); i < lm.shardCount; i++ {
+		pq := make(priorityQueue, 0)
+		heap.Init(&pq)
+		lm.shards[i] = &shard{
+			items:  make(map[string]*scheduledItem),
+			pq:     &pq,
+			wakeCh: make(chan struct{}, 1),
+		}
+		lm.wg.Add(1)
+		go lm.pruneLoop(i)
+	}
 	return lm
 }
 
-// ScheduleTimed schedules or resets a timed callback for a given ID.
-func (lm *LifetimeManager) ScheduleTimed(ctx context.Context, id string, callback LifetimeCallback, wait time.Duration) {
-	if wait == 0 {
-		wait = lm.defaultWait
+// getShard returns shard index for given ID using FNV hash.
+func (lm *LifetimeManager) getShard(id string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(id))
+	return h.Sum32() & (lm.shardCount - 1)
+}
+
+// pruneLoop runs in dedicated goroutine per shard, processing expirations.
+func (lm *LifetimeManager) pruneLoop(idx uint32) {
+	defer lm.wg.Done()
+	s := lm.shards[idx]
+	for {
+		s.mu.Lock()
+		var nextExpiry time.Time
+		var hasItem bool
+		if s.pq.Len() > 0 {
+			nextExpiry = (*s.pq)[0].expiresAt
+			hasItem = true
+		}
+		s.mu.Unlock()
+
+		if !hasItem {
+			select {
+			case <-lm.ctx.Done():
+				return
+			case <-s.wakeCh:
+				continue
+			}
+		}
+
+		now := time.Now()
+		if now.After(nextExpiry) || now.Equal(nextExpiry) {
+			lm.processExpired(s)
+			continue
+		}
+
+		wait := nextExpiry.Sub(now)
+		if wait < lm.minTick {
+			wait = lm.minTick
+		}
+
+		select {
+		case <-lm.ctx.Done():
+			return
+		case <-time.After(wait):
+			lm.processExpired(s)
+		case <-s.wakeCh:
+			continue
+		}
 	}
+}
+
+// processExpired executes all callbacks that have reached expiration.
+func (lm *LifetimeManager) processExpired(s *shard) {
+	now := time.Now()
+	s.mu.Lock()
+	expired := make([]*scheduledItem, 0)
+	for s.pq.Len() > 0 {
+		item := (*s.pq)[0]
+		if now.After(item.expiresAt) || now.Equal(item.expiresAt) {
+			heap.Pop(s.pq)
+			delete(s.items, item.id)
+			expired = append(expired, item)
+		} else {
+			break
+		}
+	}
+	s.mu.Unlock()
+
+	for _, item := range expired {
+		lm.logger.Debug("processExpired: executing callback for ID %s", item.id)
+		ctx, cancel := context.WithTimeout(context.Background(), lm.timerLimit)
+		item.callback(ctx, item.id)
+		cancel()
+	}
+}
+
+// ScheduleTimed schedules or resets a timed callback for given ID.
+func (lm *LifetimeManager) ScheduleTimed(ctx context.Context, id string, callback LifetimeCallback, wait time.Duration) {
 	if callback == nil {
 		lm.logger.Debug("ScheduleTimed: nil callback for ID %s", id)
 		return
 	}
-	lm.timersMu.Lock()
-	defer lm.timersMu.Unlock()
+	if wait <= 0 {
+		wait = 30 * time.Minute
+	}
+
+	idx := lm.getShard(id)
+	s := lm.shards[idx]
+	item := &scheduledItem{
+		callback:  callback,
+		expiresAt: time.Now().Add(wait),
+		duration:  wait,
+		id:        id,
+	}
+
+	s.mu.Lock()
 	if lm.ctx.Err() != nil {
-		return // Manager is stopping, do not schedule new
+		s.mu.Unlock()
+		return
 	}
-	// Stop existing timer if any
-	if existing, ok := lm.timers[id]; ok {
-		if !existing.timer.Stop() {
-			// Timer already fired or stopped, drain the channel if needed
-			select {
-			case <-existing.timer.C:
-			default:
-			}
-		}
-		delete(lm.timers, id)
+	if existing, ok := s.items[id]; ok {
+		heap.Remove(s.pq, existing.index)
+		delete(s.items, id)
 	}
-	// Create new timer
-	timer := time.NewTimer(wait)
-	lm.timers[id] = &activeLifetime{
-		timer:    timer,
-		callback: callback,
-		duration: wait,
-		id:       id,
-	}
-	lm.wg.Add(1)
+	s.items[id] = item
+	heap.Push(s.pq, item)
+	s.mu.Unlock()
+
 	lm.logger.Debug("ScheduleTimed: scheduled callback for ID %s in %v", id, wait)
-	// Start goroutine to handle the timer
-	go func() {
-		defer lm.wg.Done()
-		select {
-		case <-timer.C:
-			// Timer fired, execute callback
-			lm.timersMu.Lock()
-			delete(lm.timers, id)
-			lm.timersMu.Unlock()
-			lm.logger.Debug("ScheduleTimed: executing callback for ID %s", id)
-			// Execute callback with timeout
-			bgCtx, cancel := context.WithTimeout(context.Background(), lm.defaultTimer)
-			defer cancel()
-			callback(bgCtx, id)
-		case <-lm.ctx.Done():
-			// Manager stopped, clean up
-			timer.Stop()
-			lm.logger.Debug("ScheduleTimed: manager stopped, cleaning up timer for ID %s", id)
-		}
-	}()
+	select {
+	case s.wakeCh <- struct{}{}:
+	default:
+	}
 }
 
-// ScheduleLifetimeTimed schedules or resets a timed callback from a Lifetime.
+// ScheduleLifetimeTimed schedules a timed callback from a Lifetime configuration.
 func (lm *LifetimeManager) ScheduleLifetimeTimed(ctx context.Context, id string, lifetime *Lifetime) {
 	if lifetime == nil || lifetime.Timed == nil {
-		// If no timed lifetime, just reset existing if any
 		lm.ResetTimed(id)
 		return
 	}
@@ -242,14 +353,11 @@ func (lm *LifetimeManager) ScheduleLifetimeTimed(ctx context.Context, id string,
 }
 
 // ExecuteWithLifetime executes an operation with lifetime hooks and manages timed events.
-// 100% matches zevent.Manager.ExecuteWithRunner behavior.
 func (lm *LifetimeManager) ExecuteWithLifetime(ctx context.Context, id string, lifetime *Lifetime, operation Func) error {
 	if lifetime == nil {
 		return operation()
 	}
-	// Execute with hooks
 	err := lifetime.Execute(ctx, id, operation)
-	// If successful and we have a Timed callback, schedule it
 	if err == nil && lifetime.Timed != nil {
 		lm.ScheduleLifetimeTimed(ctx, id, lifetime)
 	}
@@ -257,48 +365,48 @@ func (lm *LifetimeManager) ExecuteWithLifetime(ctx context.Context, id string, l
 }
 
 // ExecuteCtxWithLifetime executes a context-aware operation with lifetime hooks.
-// Jack extension - not in original zevent.
 func (lm *LifetimeManager) ExecuteCtxWithLifetime(ctx context.Context, id string, lifetime *Lifetime, operation FuncCtx) error {
 	if lifetime == nil {
 		return operation(ctx)
 	}
-	// Execute with hooks
 	err := lifetime.ExecuteCtx(ctx, id, operation)
-	// If successful and we have a Timed callback, schedule it
 	if err == nil && lifetime.Timed != nil {
 		lm.ScheduleLifetimeTimed(ctx, id, lifetime)
 	}
 	return err
 }
 
-// ResetTimed resets the timer for an existing lifetime (Keep-Alive).
+// ResetTimed extends expiration of existing item (Keep-Alive).
 func (lm *LifetimeManager) ResetTimed(id string) bool {
-	lm.timersMu.Lock()
-	defer lm.timersMu.Unlock()
-	if timer, exists := lm.timers[id]; exists {
-		// Stop the timer first
-		if !timer.timer.Stop() {
-			// If Stop() returns false, the timer has already fired or been stopped
-			delete(lm.timers, id)
-			lm.logger.Debug("ResetTimed: timer already fired for ID %s", id)
-			return false
+	idx := lm.getShard(id)
+	s := lm.shards[idx]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if item, exists := s.items[id]; exists {
+		item.expiresAt = time.Now().Add(item.duration)
+		heap.Fix(s.pq, item.index)
+		lm.logger.Debug("ResetTimed: extended timer for ID %s", id)
+		select {
+		case s.wakeCh <- struct{}{}:
+		default:
 		}
-		// Reset the timer
-		timer.timer.Reset(timer.duration)
-		lm.logger.Debug("ResetTimed: reset timer for ID %s", id)
 		return true
 	}
 	lm.logger.Debug("ResetTimed: no timer found for ID %s", id)
 	return false
 }
 
-// CancelTimed cancels and removes a timed callback.
+// CancelTimed removes a scheduled callback.
 func (lm *LifetimeManager) CancelTimed(id string) bool {
-	lm.timersMu.Lock()
-	defer lm.timersMu.Unlock()
-	if timer, ok := lm.timers[id]; ok {
-		timer.timer.Stop()
-		delete(lm.timers, id)
+	idx := lm.getShard(id)
+	s := lm.shards[idx]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if item, ok := s.items[id]; ok {
+		heap.Remove(s.pq, item.index)
+		delete(s.items, id)
 		lm.logger.Debug("CancelTimed: cancelled timer for ID %s", id)
 		return true
 	}
@@ -306,48 +414,58 @@ func (lm *LifetimeManager) CancelTimed(id string) bool {
 	return false
 }
 
-// StopAll cancels all pending timed callbacks and waits for them to complete.
+// StopAll cancels all pending callbacks and stops the manager.
 func (lm *LifetimeManager) StopAll() {
-	lm.logger.Info("StopAll: stopping all timers")
-	// Cancel context to signal all goroutines
+	lm.logger.Info("StopAll: stopping lifetime manager")
 	lm.cancel()
-	// Stop all timers
-	lm.timersMu.Lock()
-	for id, timer := range lm.timers {
-		timer.timer.Stop()
-		delete(lm.timers, id)
-	}
-	lm.timersMu.Unlock()
-	// Wait for all goroutines to complete
 	lm.wg.Wait()
+
+	for _, s := range lm.shards {
+		s.mu.Lock()
+		s.items = make(map[string]*scheduledItem)
+		*s.pq = (*s.pq)[:0]
+		s.mu.Unlock()
+	}
 	lm.logger.Info("StopAll: all timers stopped")
 }
 
 // HasPending checks if there's a pending timed callback for an ID.
 func (lm *LifetimeManager) HasPending(id string) bool {
-	lm.timersMu.RLock()
-	_, exists := lm.timers[id]
-	lm.timersMu.RUnlock()
+	idx := lm.getShard(id)
+	s := lm.shards[idx]
+	s.mu.Lock()
+	_, exists := s.items[id]
+	s.mu.Unlock()
 	return exists
 }
 
-// PendingCount returns the number of pending timed callbacks.
+// PendingCount returns total number of pending timed callbacks across all shards.
 func (lm *LifetimeManager) PendingCount() int {
-	lm.timersMu.RLock()
-	count := len(lm.timers)
-	lm.timersMu.RUnlock()
+	count := 0
+	for _, s := range lm.shards {
+		s.mu.Lock()
+		count += len(s.items)
+		s.mu.Unlock()
+	}
 	return count
 }
 
-// GetRemainingDuration returns the configured duration for a pending callback.
+// GetRemainingDuration returns time until expiration for a pending callback.
 func (lm *LifetimeManager) GetRemainingDuration(id string) (time.Duration, bool) {
-	lm.timersMu.RLock()
-	timer, exists := lm.timers[id]
-	lm.timersMu.RUnlock()
-	if !exists || timer == nil {
+	idx := lm.getShard(id)
+	s := lm.shards[idx]
+	s.mu.Lock()
+	item, exists := s.items[id]
+	s.mu.Unlock()
+
+	if !exists {
 		return 0, false
 	}
-	return timer.duration, true
+	remaining := time.Until(item.expiresAt)
+	if remaining < 0 {
+		return 0, false
+	}
+	return remaining, true
 }
 
 // Stop gracefully stops the LifetimeManager.
