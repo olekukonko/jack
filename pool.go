@@ -21,6 +21,7 @@ type Pool struct {
 	numWorkers int
 	opts       poolingOpt
 	mu         sync.RWMutex
+	sendMu     sync.RWMutex
 	closed     bool
 	logger     *ll.Logger
 }
@@ -123,16 +124,50 @@ func (p *Pool) DoCtx(ctx context.Context, fn func(ctx context.Context)) {
 	_ = p.SubmitCtx(ctx, FuncCtx(func(ctx context.Context) error { fn(ctx); return nil }))
 }
 
+// tryEnqueue attempts to send a job to the pool's task channel.
+// It returns (sent, poolClosed) where sent indicates successful enqueue,
+// and poolClosed indicates the pool was closed during the attempt.
+func (p *Pool) tryEnqueue(job job, ctx context.Context, nonBlocking bool) (sent, poolClosed bool) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return false, true
+	}
+	if nonBlocking {
+		select {
+		case p.tasks <- job:
+			p.mu.Unlock()
+			return true, false
+		default:
+			p.mu.Unlock()
+			return false, false
+		}
+	}
+	// Release state lock before blocking.
+	// Hold sendMu read lock so Shutdown cannot close(p.tasks) while we're sending.
+	p.mu.Unlock()
+	p.sendMu.RLock()
+	defer p.sendMu.RUnlock()
+	// Re-check closed: Shutdown sets p.closed before acquiring sendMu write lock.
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return false, true
+	}
+	p.mu.RUnlock()
+
+	select {
+	case p.tasks <- job:
+		return true, false
+	case <-ctx.Done():
+		return false, false
+	}
+}
+
 // Submit enqueues one or more tasks to the pool for execution without context.
 // Checks if pool is closed; returns error for nil tasks or full queue.
 // Notifies observable of queued events and logs submission details.
 func (p *Pool) Submit(ts ...Task) error {
-	p.mu.RLock()
-	if p.closed {
-		p.mu.RUnlock()
-		return ErrPoolClosed
-	}
-	p.mu.RUnlock()
 	for i, t := range ts {
 		if t == nil {
 			if p.logger != nil {
@@ -150,16 +185,18 @@ func (p *Pool) Submit(ts ...Task) error {
 		if p.observable != nil {
 			p.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 		}
-		select {
-		case p.tasks <- job:
-			if p.logger != nil {
-				p.logger.Debug("Pool.Submit: enqueued task %s", taskID)
-			}
-		default:
+		sent, poolClosed := p.tryEnqueue(job, context.Background(), true)
+		if poolClosed {
+			return ErrPoolClosed
+		}
+		if !sent {
 			if p.logger != nil {
 				p.logger.Warn("Pool.Submit: failed to enqueue task %s (index %d): queue full", taskID, i)
 			}
 			return ErrQueueFull
+		}
+		if p.logger != nil {
+			p.logger.Debug("Pool.Submit: enqueued task %s", taskID)
 		}
 	}
 	return nil
@@ -174,12 +211,6 @@ func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 		return ctx.Err()
 	default:
 	}
-	p.mu.RLock()
-	if p.closed {
-		p.mu.RUnlock()
-		return ErrPoolClosed
-	}
-	p.mu.RUnlock()
 	for i, t := range ts {
 		if t == nil {
 			if p.logger != nil {
@@ -197,16 +228,18 @@ func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 		if p.observable != nil {
 			p.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 		}
-		select {
-		case p.tasks <- job:
-			if p.logger != nil {
-				p.logger.Debug("Pool.SubmitCtx: enqueued task %s", taskID)
-			}
-		case <-ctx.Done():
+		sent, poolClosed := p.tryEnqueue(job, ctx, false)
+		if poolClosed {
+			return ErrPoolClosed
+		}
+		if !sent {
 			if p.logger != nil {
 				p.logger.Info("Pool.SubmitCtx: context done while submitting task %s (index %d): %v", taskID, i, ctx.Err())
 			}
 			return ctx.Err()
+		}
+		if p.logger != nil {
+			p.logger.Debug("Pool.SubmitCtx: enqueued task %s", taskID)
 		}
 	}
 	return nil
@@ -223,12 +256,16 @@ func (p *Pool) Shutdown(timeout time.Duration) error {
 	}
 	p.closed = true
 	p.mu.Unlock()
+	// Acquire write lock to wait for all in-flight blocking senders to finish.
+	// Senders hold RLock; once they see p.closed=true they return without sending.
+	// This ensures no goroutine is blocked on p.tasks when we close it.
+	p.sendMu.Lock()
+	close(p.tasks)
+	p.sendMu.Unlock()
 	if p.logger != nil {
 		p.logger.Info("Pool shutdown started, workers: %d, goroutines: %d", p.numWorkers, runtime.NumGoroutine())
 	}
-	p.quitOnce.Do(func() {
-		close(p.tasks)
-	})
+	p.quitOnce.Do(func() {})
 	done := make(chan struct{})
 	go func() {
 		if p.logger != nil {
