@@ -1,3 +1,4 @@
+// pool.go - Optimized with lock-free state management
 package jack
 
 import (
@@ -5,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/olekukonko/ll"
@@ -20,10 +22,15 @@ type Pool struct {
 	observable Observable[Event]
 	numWorkers int
 	opts       poolingOpt
-	mu         sync.RWMutex
-	sendMu     sync.RWMutex
-	closed     bool
-	logger     *ll.Logger
+
+	// Lock-free state
+	closed atomic.Bool
+
+	// sendMu protects the channel close operation only
+	// Writers hold RLock; Shutdown acquires Lock before close(tasks)
+	sendMu sync.RWMutex
+
+	logger *ll.Logger
 }
 
 // poolingOpt holds configuration options for the pool, such as queue size, observable, and ID generator.
@@ -113,13 +120,12 @@ func (p *Pool) Logger(extLogger *ll.Logger) *Pool {
 	return p
 }
 
-// Do is a shorthand for pool.Submit(Func(...)) but discards any returned error.
-// It exists purely for ergonomic, fire-and-forget usage.
+// Do is a shorthand for pool.Submit(Func(...)) but discards any returned error
 func (p *Pool) Do(fn func()) {
 	_ = p.Submit(Func(func() error { fn(); return nil }))
 }
 
-// DoCtx is a shorthand for pool.SubmitCtx(FuncCtx(...)) but discards any returned error.
+// DoCtx is a shorthand for pool.SubmitCtx(FuncCtx(...)) but discards any returned error
 func (p *Pool) DoCtx(ctx context.Context, fn func(ctx context.Context)) {
 	_ = p.SubmitCtx(ctx, FuncCtx(func(ctx context.Context) error { fn(ctx); return nil }))
 }
@@ -128,33 +134,38 @@ func (p *Pool) DoCtx(ctx context.Context, fn func(ctx context.Context)) {
 // It returns (sent, poolClosed) where sent indicates successful enqueue,
 // and poolClosed indicates the pool was closed during the attempt.
 func (p *Pool) tryEnqueue(job job, ctx context.Context, nonBlocking bool) (sent, poolClosed bool) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+	// Fast path: lock-free closed check (hot path)
+	if p.closed.Load() {
 		return false, true
 	}
+
 	if nonBlocking {
+		// Non-blocking: try send with default case
 		select {
 		case p.tasks <- job:
-			p.mu.Unlock()
 			return true, false
 		default:
-			p.mu.Unlock()
+			// Queue full - recheck closed and return
+			if p.closed.Load() {
+				return false, true
+			}
 			return false, false
 		}
 	}
-	// Release state lock before blocking.
-	// Hold sendMu read lock so Shutdown cannot close(p.tasks) while we're sending.
-	p.mu.Unlock()
-	p.sendMu.RLock()
-	defer p.sendMu.RUnlock()
-	// Re-check closed: Shutdown sets p.closed before acquiring sendMu write lock.
-	p.mu.RLock()
-	if p.closed {
-		p.mu.RUnlock()
+
+	// Blocking path: need to hold sendMu.RLock to prevent close during send
+	// This is the slow path, but still check closed first to avoid lock in shutdown case
+	if p.closed.Load() {
 		return false, true
 	}
-	p.mu.RUnlock()
+
+	p.sendMu.RLock()
+	defer p.sendMu.RUnlock()
+
+	// Double-check after acquiring lock
+	if p.closed.Load() {
+		return false, true
+	}
 
 	select {
 	case p.tasks <- job:
@@ -170,9 +181,7 @@ func (p *Pool) tryEnqueue(job job, ctx context.Context, nonBlocking bool) (sent,
 func (p *Pool) Submit(ts ...Task) error {
 	for i, t := range ts {
 		if t == nil {
-			if p.logger != nil {
-				p.logger.Info("Pool.Submit received nil task at index %d", i)
-			}
+			p.logger.Info("Pool.Submit received nil task at index %d", i)
 			return fmt.Errorf("nil task at index %d in batch", i)
 		}
 		job := &tasker{
@@ -185,19 +194,17 @@ func (p *Pool) Submit(ts ...Task) error {
 		if p.observable != nil {
 			p.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 		}
+
+		// Lock-free fast path
 		sent, poolClosed := p.tryEnqueue(job, context.Background(), true)
 		if poolClosed {
 			return ErrPoolClosed
 		}
 		if !sent {
-			if p.logger != nil {
-				p.logger.Warn("Pool.Submit: failed to enqueue task %s (index %d): queue full", taskID, i)
-			}
+			p.logger.Warn("Pool.Submit: failed to enqueue task %s (index %d): queue full", taskID, i)
 			return ErrQueueFull
 		}
-		if p.logger != nil {
-			p.logger.Debug("Pool.Submit: enqueued task %s", taskID)
-		}
+		p.logger.Debug("Pool.Submit: enqueued task %s", taskID)
 	}
 	return nil
 }
@@ -211,11 +218,10 @@ func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 		return ctx.Err()
 	default:
 	}
+
 	for i, t := range ts {
 		if t == nil {
-			if p.logger != nil {
-				p.logger.Info("Pool.SubmitCtx received nil TaskCtx at index %d", i)
-			}
+			p.logger.Info("Pool.SubmitCtx received nil TaskCtx at index %d", i)
 			return fmt.Errorf("nil TaskCtx at index %d in batch", i)
 		}
 		job := &tasker{
@@ -228,19 +234,17 @@ func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 		if p.observable != nil {
 			p.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 		}
+
+		// Lock-free attempt first
 		sent, poolClosed := p.tryEnqueue(job, ctx, false)
 		if poolClosed {
 			return ErrPoolClosed
 		}
 		if !sent {
-			if p.logger != nil {
-				p.logger.Info("Pool.SubmitCtx: context done while submitting task %s (index %d): %v", taskID, i, ctx.Err())
-			}
+			p.logger.Info("Pool.SubmitCtx: context done while submitting task %s (index %d): %v", taskID, i, ctx.Err())
 			return ctx.Err()
 		}
-		if p.logger != nil {
-			p.logger.Debug("Pool.SubmitCtx: enqueued task %s", taskID)
-		}
+		p.logger.Debug("Pool.SubmitCtx: enqueued task %s", taskID)
 	}
 	return nil
 }
@@ -249,44 +253,34 @@ func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 // Idempotent; logs shutdown process and returns timeout error if workers don't finish in time.
 // Ensures no new tasks are accepted after initiation.
 func (p *Pool) Shutdown(timeout time.Duration) error {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+	// Fast path: already closed
+	if !p.closed.CompareAndSwap(false, true) {
 		return ErrPoolClosed
 	}
-	p.closed = true
-	p.mu.Unlock()
-	// Acquire write lock to wait for all in-flight blocking senders to finish.
-	// Senders hold RLock; once they see p.closed=true they return without sending.
-	// This ensures no goroutine is blocked on p.tasks when we close it.
+
+	// Acquire write lock to wait for all in-flight blocking senders
 	p.sendMu.Lock()
 	close(p.tasks)
 	p.sendMu.Unlock()
-	if p.logger != nil {
-		p.logger.Info("Pool shutdown started, workers: %d, goroutines: %d", p.numWorkers, runtime.NumGoroutine())
-	}
+
+	p.logger.Info("Pool shutdown started, workers: %d, goroutines: %d", p.numWorkers, runtime.NumGoroutine())
+
 	p.quitOnce.Do(func() {})
+
 	done := make(chan struct{})
 	go func() {
-		if p.logger != nil {
-			p.logger.Info("Waiting for %d workers to shut down...", p.numWorkers)
-		}
+		p.logger.Info("Waiting for %d workers to shut down...", p.numWorkers)
 		p.shutdownWg.Wait()
-		if p.logger != nil {
-			p.logger.Info("All %d workers shut down, goroutines: %d", p.numWorkers, runtime.NumGoroutine())
-		}
+		p.logger.Info("All %d workers shut down, goroutines: %d", p.numWorkers, runtime.NumGoroutine())
 		close(done)
 	}()
+
 	select {
 	case <-done:
-		if p.logger != nil {
-			p.logger.Info("Pool shutdown completed successfully.")
-		}
+		p.logger.Info("Pool shutdown completed successfully.")
 		return nil
 	case <-time.After(timeout):
-		if p.logger != nil {
-			p.logger.Warn("Pool shutdown timed out after %v, goroutines: %d", timeout, runtime.NumGoroutine())
-		}
+		p.logger.Warn("Pool shutdown timed out after %v, goroutines: %d", timeout, runtime.NumGoroutine())
 		return ErrShutdownTimedOut
 	}
 }
@@ -303,4 +297,9 @@ func (p *Pool) QueueSize() int {
 // Helpful for querying pool capacity.
 func (p *Pool) Workers() int {
 	return p.numWorkers
+}
+
+// IsClosed returns true if the pool has been closed
+func (p *Pool) IsClosed() bool {
+	return p.closed.Load()
 }
