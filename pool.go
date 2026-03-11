@@ -1,4 +1,3 @@
-// pool.go - Optimized with lock-free state management
 package jack
 
 import (
