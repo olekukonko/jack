@@ -42,6 +42,79 @@ func (c *LoopConfig) validate() {
 	}
 }
 
+// LooperMetrics tracks comprehensive operational metrics.
+type LooperMetrics struct {
+	Executions      atomic.Uint64
+	Failures        atomic.Uint64
+	Successes       atomic.Uint64
+	BackoffEvents   atomic.Uint64
+	IntervalChanges atomic.Uint64
+	PanicsRecovered atomic.Uint64
+	ContextCancels  atomic.Uint64
+	Timeouts        atomic.Uint64
+
+	LastRun   atomic.Value
+	LastError atomic.Value
+	LastStart atomic.Int64
+	LastEnd   atomic.Int64
+
+	TotalDurationNs atomic.Int64
+	MinDurationNs   atomic.Int64
+	MaxDurationNs   atomic.Int64
+
+	CurrentIntervalNs atomic.Int64
+	CurrentBackoffNs  atomic.Int64
+}
+
+func (m *LooperMetrics) recordExecution(start time.Time, err error) {
+	m.Executions.Add(1)
+	m.LastRun.Store(start)
+	m.LastStart.Store(start.UnixNano())
+
+	end := time.Now()
+	m.LastEnd.Store(end.UnixNano())
+
+	duration := end.Sub(start)
+	durationNs := int64(duration)
+	m.TotalDurationNs.Add(durationNs)
+
+	// Min duration (0 means unset)
+	for {
+		current := m.MinDurationNs.Load()
+		if current == 0 || durationNs < current {
+			if m.MinDurationNs.CompareAndSwap(current, durationNs) {
+				break
+			}
+		} else {
+			break
+		}
+	}
+
+	// Max duration
+	for {
+		current := m.MaxDurationNs.Load()
+		if durationNs > current {
+			if m.MaxDurationNs.CompareAndSwap(current, durationNs) {
+				break
+			}
+		} else {
+			break
+		}
+	}
+
+	if err != nil {
+		m.Failures.Add(1)
+		m.LastError.Store(err)
+	} else {
+		m.Successes.Add(1)
+	}
+}
+
+func (m *LooperMetrics) recordPanic() {
+	m.PanicsRecovered.Add(1)
+	m.LastError.Store(&CaughtPanic{Value: "panic in looper task"})
+}
+
 type Looper struct {
 	config          LoopConfig
 	task            func() error
@@ -56,15 +129,6 @@ type Looper struct {
 	logger          *ll.Logger
 	metrics         *LooperMetrics
 	resetCh         chan struct{}
-}
-
-type LooperMetrics struct {
-	Executions      atomic.Uint64
-	Failures        atomic.Uint64
-	BackoffEvents   atomic.Uint64
-	IntervalChanges atomic.Uint64
-	LastRun         atomic.Value
-	LastError       atomic.Value
 }
 
 type LooperOption func(*LoopConfig)
@@ -109,7 +173,7 @@ func WithLooperLogger(logger *ll.Logger) LooperOption {
 	return func(c *LoopConfig) { c.Logger = logger }
 }
 
-// NewLooper creates a new Looper that repeatedly executes the given task according to the configured interval and options.
+// NewLooper creates a new Looper with full metrics.
 func NewLooper(task Func, opts ...LooperOption) *Looper {
 	if task == nil {
 		panic("looper: task cannot be nil")
@@ -146,10 +210,15 @@ func NewLooper(task Func, opts ...LooperOption) *Looper {
 		resetCh: make(chan struct{}, 1),
 	}
 	l.currentInterval.Store(int64(cfg.Interval))
+	l.metrics.CurrentIntervalNs.Store(int64(cfg.Interval))
 	return l
 }
 
-// Start initiates the looper's background execution loop, causing the task to run repeatedly according to the configured schedule.
+// Metrics returns the looper's metrics.
+func (l *Looper) Metrics() *LooperMetrics {
+	return l.metrics
+}
+
 func (l *Looper) Start() {
 	if l.running.Swap(true) {
 		return
@@ -182,6 +251,7 @@ func (l *Looper) SetInterval(d time.Duration) {
 	old := l.currentInterval.Swap(int64(d))
 	if old != int64(d) {
 		l.metrics.IntervalChanges.Add(1)
+		l.metrics.CurrentIntervalNs.Store(int64(d))
 		l.logger.Debug("interval changed: %v -> %v", time.Duration(old), d)
 		select {
 		case l.resetCh <- struct{}{}:
@@ -192,14 +262,11 @@ func (l *Looper) SetInterval(d time.Duration) {
 
 func (l *Looper) ResetInterval() {
 	l.SetInterval(l.config.Interval)
+	l.metrics.CurrentBackoffNs.Store(0)
 }
 
 func (l *Looper) CurrentInterval() time.Duration {
 	return time.Duration(l.currentInterval.Load())
-}
-
-func (l *Looper) Metrics() *LooperMetrics {
-	return l.metrics
 }
 
 func (l *Looper) IsRunning() bool {
@@ -228,6 +295,7 @@ func (l *Looper) run() {
 	for {
 		select {
 		case <-l.ctx.Done():
+			l.metrics.ContextCancels.Add(1)
 			l.logger.Info("looper context done: %v", l.ctx.Err())
 			return
 		case <-ticker.C:
@@ -240,13 +308,11 @@ func (l *Looper) run() {
 }
 
 func (l *Looper) execute() {
-	l.metrics.Executions.Add(1)
-	l.metrics.LastRun.Store(time.Now())
 	start := time.Now()
 	err := l.safeExecute()
+	l.metrics.recordExecution(start, err)
+
 	if err != nil {
-		l.metrics.Failures.Add(1)
-		l.metrics.LastError.Store(err)
 		l.failureCount.Add(1)
 		if l.config.Backoff {
 			l.metrics.BackoffEvents.Add(1)
@@ -266,6 +332,7 @@ func (l *Looper) execute() {
 func (l *Looper) safeExecute() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			l.metrics.recordPanic()
 			err = &CaughtPanic{
 				Value: r,
 				Stack: debug.Stack(),
@@ -286,6 +353,7 @@ func (l *Looper) applyBackoff() {
 		backoff = l.config.MinInterval
 	}
 	l.SetInterval(backoff)
+	l.metrics.CurrentBackoffNs.Store(int64(backoff))
 	l.logger.Debug("backoff applied: %v (failures=%d)", backoff, failures)
 }
 
