@@ -1,3 +1,4 @@
+// doctor.go (your updated version with rolling average fix)
 package jack
 
 import (
@@ -50,6 +51,8 @@ type Doctor struct {
 	stopped atomic.Bool
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
+
+	verbose atomic.Bool
 }
 
 type DoctorOption func(*Doctor)
@@ -94,6 +97,12 @@ func DoctorWithLogger(l *ll.Logger) DoctorOption {
 	}
 }
 
+func DoctorWithVerbose(v bool) DoctorOption {
+	return func(d *Doctor) {
+		d.verbose.Store(v)
+	}
+}
+
 // NewDoctor creates a Doctor with global metrics.
 func NewDoctor(opts ...DoctorOption) *Doctor {
 	d := &Doctor{
@@ -110,10 +119,12 @@ func NewDoctor(opts ...DoctorOption) *Doctor {
 	}
 	if d.pool == nil {
 		d.pool = NewPool(d.maxConcurrent)
+		d.logger.Fields("maxConcurrent", d.maxConcurrent).Info("created default pool")
 	}
 	heap.Init(&d.pq)
 	d.wg.Add(1)
 	go d.scheduler()
+	d.logger.Info("doctor started")
 	return d
 }
 
@@ -124,6 +135,7 @@ func (d *Doctor) Metrics() *DoctorMetrics {
 
 func (d *Doctor) Add(p *Patient) error {
 	if p.cfg.Check == nil {
+		d.logger.Fields("patientID", p.cfg.ID).Error("add failed: Check function required")
 		return fmt.Errorf("patient %s: Check function required", p.cfg.ID)
 	}
 	if p.cfg.Timeout <= 0 {
@@ -138,6 +150,7 @@ func (d *Doctor) Add(p *Patient) error {
 	d.patientsMu.Lock()
 	if old, ok := d.patients[p.cfg.ID]; ok {
 		old.removed.Store(true)
+		d.logger.Fields("patientID", p.cfg.ID).Warn("replaced existing patient")
 	}
 	d.patients[p.cfg.ID] = p
 	d.metrics.PatientsTotal.Store(int64(len(d.patients)))
@@ -153,6 +166,8 @@ func (d *Doctor) Add(p *Patient) error {
 	heap.Push(&d.pq, p)
 	d.mu.Unlock()
 	d.wake()
+
+	d.logger.Fields("patientID", p.cfg.ID, "interval", p.cfg.Interval, "delay", delay).Info("patient added")
 	return nil
 }
 
@@ -164,9 +179,39 @@ func (d *Doctor) Remove(id string) bool {
 		p.removed.Store(true)
 		p.Remove()
 		d.metrics.PatientsTotal.Store(int64(len(d.patients)))
+		d.logger.Fields("patientID", id).Info("patient removed")
 	}
 	d.patientsMu.Unlock()
 	return ok
+}
+
+// Stop stops a single patient by ID. Returns true if found and stopped.
+func (d *Doctor) Stop(id string) bool {
+	d.patientsMu.RLock()
+	p, ok := d.patients[id]
+	d.patientsMu.RUnlock()
+
+	if !ok {
+		d.logger.Fields("patientID", id).Warn("stop failed: not found")
+		return false
+	}
+
+	if p.removed.Load() {
+		d.logger.Fields("patientID", id).Warn("stop failed: already removed")
+		return false
+	}
+
+	p.removed.Store(true)
+	p.Remove()
+
+	d.patientsMu.Lock()
+	delete(d.patients, id)
+	d.metrics.PatientsTotal.Store(int64(len(d.patients)))
+	d.patientsMu.Unlock()
+
+	d.wake()
+	d.logger.Fields("patientID", id).Info("patient stopped")
+	return true
 }
 
 func (d *Doctor) SetDegraded(id string, degraded bool) {
@@ -174,6 +219,7 @@ func (d *Doctor) SetDegraded(id string, degraded bool) {
 	p, ok := d.patients[id]
 	d.patientsMu.RUnlock()
 	if !ok {
+		d.logger.Fields("patientID", id).Warn("SetDegraded failed: not found")
 		return
 	}
 	p.setDegraded(degraded, d)
@@ -191,12 +237,15 @@ func (d *Doctor) GetState(id string) (PatientState, bool) {
 
 func (d *Doctor) StopAll(timeout time.Duration) {
 	if !d.stopped.CompareAndSwap(false, true) {
+		d.logger.Warn("StopAll: already stopped")
 		return
 	}
+	d.logger.Fields("timeout", timeout).Info("stopping all patients")
 	close(d.stopCh)
 	d.wg.Wait()
 
 	d.patientsMu.Lock()
+	count := len(d.patients)
 	for _, p := range d.patients {
 		p.removed.Store(true)
 	}
@@ -205,6 +254,7 @@ func (d *Doctor) StopAll(timeout time.Duration) {
 	if d.pool != nil {
 		_ = d.pool.Shutdown(timeout)
 	}
+	d.logger.Fields("count", count).Info("all patients stopped")
 }
 
 func (d *Doctor) scheduler() {
@@ -296,6 +346,7 @@ func (d *Doctor) submitCheck(p *Patient) {
 					e = fmt.Errorf("check panicked: %v", r)
 					d.metrics.PanicsRecovered.Add(1)
 					p.metrics.PanicsRecovered.Add(1)
+					d.logger.Fields("patientID", cfg.ID, "panic", r).Error("check panicked")
 				}
 			}()
 			return cfg.Check(execCtx)
@@ -308,14 +359,21 @@ func (d *Doctor) submitCheck(p *Patient) {
 		duration := time.Since(start)
 		checkMs := int64(duration.Milliseconds())
 
+		// Load total once to avoid race in rolling average calculation
+		total := d.metrics.ChecksTotal.Load()
 		d.metrics.ChecksTotal.Add(1)
 		p.metrics.ChecksTotal.Add(1)
 		p.metrics.LastCheckMs.Store(checkMs)
 
-		// Update rolling average
+		// Update rolling average atomically
 		for {
 			oldAvg := p.metrics.AvgCheckMs.Load()
-			newAvg := (oldAvg*int64(p.metrics.ChecksTotal.Load()-1) + checkMs) / int64(p.metrics.ChecksTotal.Load())
+			var newAvg int64
+			if total == 0 {
+				newAvg = checkMs
+			} else {
+				newAvg = (oldAvg*int64(total) + checkMs) / int64(total+1)
+			}
 			if p.metrics.AvgCheckMs.CompareAndSwap(oldAvg, newAvg) {
 				break
 			}
@@ -332,6 +390,15 @@ func (d *Doctor) submitCheck(p *Patient) {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				d.metrics.Timeouts.Add(1)
 				p.metrics.Timeouts.Add(1)
+
+				if d.verbose.Load() {
+					d.logger.Fields("patientID", cfg.ID, "duration", duration).Warn("check timeout")
+				}
+
+			} else {
+				if d.verbose.Load() {
+					d.logger.Fields("patientID", cfg.ID, "duration", duration, "error", err).Error("check failed")
+				}
 			}
 			p.handleFailure(err, cfg)
 		} else {
@@ -340,6 +407,9 @@ func (d *Doctor) submitCheck(p *Patient) {
 			p.metrics.ConsecSuccesses.Add(1)
 			p.metrics.ConsecFailures.Store(0)
 			p.handleSuccess(cfg)
+			if d.verbose.Load() {
+				d.logger.Fields("patientID", cfg.ID, "duration", duration).Debug("check healthy")
+			}
 		}
 
 		if d.observable != nil {
@@ -362,6 +432,7 @@ func (d *Doctor) submitCheck(p *Patient) {
 
 	if submitted != nil {
 		d.metrics.PoolSubmitFails.Add(1)
+		d.logger.Fields("patientID", p.cfg.ID, "error", submitted).Error("pool submit failed")
 	} else {
 		d.metrics.PoolSubmits.Add(1)
 	}
