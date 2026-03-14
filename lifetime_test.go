@@ -11,12 +11,12 @@ import (
 func TestLifetime_Execute_Success(t *testing.T) {
 	var startCalled, endCalled, operationCalled atomic.Bool
 
-	lifetime := NewLifetime(
-		LifetimeWithStart(func(ctx context.Context, id string) error {
+	lifetime := NewVitals(
+		VitalsWithStart(func(ctx context.Context, id string) error {
 			startCalled.Store(true)
 			return nil
 		}),
-		LifetimeWithEnd(func(ctx context.Context, id string) {
+		VitalsWithEnd(func(ctx context.Context, id string) {
 			endCalled.Store(true)
 		}),
 	)
@@ -43,11 +43,11 @@ func TestLifetime_Execute_Success(t *testing.T) {
 func TestLifetime_Execute_StartError(t *testing.T) {
 	expectedErr := context.Canceled
 
-	lifetime := NewLifetime(
-		LifetimeWithStart(func(ctx context.Context, id string) error {
+	lifetime := NewVitals(
+		VitalsWithStart(func(ctx context.Context, id string) error {
 			return expectedErr
 		}),
-		LifetimeWithEnd(func(ctx context.Context, id string) {
+		VitalsWithEnd(func(ctx context.Context, id string) {
 			t.Error("End should not be called when Start fails")
 		}),
 	)
@@ -69,12 +69,12 @@ func TestLifetime_Execute_StartError(t *testing.T) {
 func TestLifetime_Execute_OperationError(t *testing.T) {
 	var startCalled, endCalled atomic.Bool
 
-	lifetime := NewLifetime(
-		LifetimeWithStart(func(ctx context.Context, id string) error {
+	lifetime := NewVitals(
+		VitalsWithStart(func(ctx context.Context, id string) error {
 			startCalled.Store(true)
 			return nil
 		}),
-		LifetimeWithEnd(func(ctx context.Context, id string) {
+		VitalsWithEnd(func(ctx context.Context, id string) {
 			endCalled.Store(true)
 		}),
 	)
@@ -96,12 +96,12 @@ func TestLifetime_Execute_OperationError(t *testing.T) {
 }
 
 func TestLifetimeManager_ExecuteWithLifetime_SuccessWithTimed(t *testing.T) {
-	lm := NewLifetimeManager()
+	lm := NewLifetime()
 	defer lm.StopAll()
 
 	var timedCalled atomic.Bool
-	lifetime := NewLifetime(
-		LifetimeWithTimed(func(ctx context.Context, id string) {
+	lifetime := NewVitals(
+		VitalsWithTimed(func(ctx context.Context, id string) {
 			timedCalled.Store(true)
 		}, 100*time.Millisecond),
 	)
@@ -140,8 +140,8 @@ func TestLifetime_WithEndNoError(t *testing.T) {
 	// Test that End hook doesn't return error (matching zevent)
 	var endCalled atomic.Bool
 
-	lifetime := NewLifetime(
-		LifetimeWithEnd(func(ctx context.Context, id string) {
+	lifetime := NewVitals(
+		VitalsWithEnd(func(ctx context.Context, id string) {
 			endCalled.Store(true)
 			// No return value - matches zevent
 		}),
@@ -164,12 +164,12 @@ func TestLifetime_Chaining(t *testing.T) {
 	// Test that With methods can be chained (like original zevent)
 	var startCalled, endCalled atomic.Bool
 
-	lifetime := NewLifetime(
-		LifetimeWithStart(func(ctx context.Context, id string) error {
+	lifetime := NewVitals(
+		VitalsWithStart(func(ctx context.Context, id string) error {
 			startCalled.Store(true)
 			return nil
 		}),
-		LifetimeWithEnd(func(ctx context.Context, id string) {
+		VitalsWithEnd(func(ctx context.Context, id string) {
 			endCalled.Store(true)
 		}),
 	)
@@ -191,7 +191,7 @@ func TestLifetime_Chaining(t *testing.T) {
 
 func TestLifetime_NoHooks(t *testing.T) {
 	// Test lifetime with no hooks (should just run operation)
-	lifetime := NewLifetime()
+	lifetime := NewVitals()
 
 	var operationCalled atomic.Bool
 	err := lifetime.Execute(context.Background(), "test-id", Func(func() error {
@@ -210,13 +210,13 @@ func TestLifetime_NoHooks(t *testing.T) {
 func TestLifetime_OnlyTimed(t *testing.T) {
 	// Test lifetime with only Timed hook
 	var timedCalled atomic.Bool
-	lifetime := NewLifetime(
-		LifetimeWithTimed(func(ctx context.Context, id string) {
+	lifetime := NewVitals(
+		VitalsWithTimed(func(ctx context.Context, id string) {
 			timedCalled.Store(true)
 		}, 50*time.Millisecond),
 	)
 
-	lm := NewLifetimeManager()
+	lm := NewLifetime()
 	defer lm.StopAll()
 
 	err := lm.ExecuteWithLifetime(context.Background(), "test-id", lifetime, Func(func() error {
@@ -234,20 +234,20 @@ func TestLifetime_OnlyTimed(t *testing.T) {
 }
 
 func TestLifetimeManager_ContextPropagation(t *testing.T) {
-	lm := NewLifetimeManager()
+	lm := NewLifetime()
 	defer lm.StopAll()
 
 	// Test that context is passed to callbacks
 	var startCtx, endCtx context.Context
 	var startID, endID string
 
-	lifetime := NewLifetime(
-		LifetimeWithStart(func(ctx context.Context, id string) error {
+	lifetime := NewVitals(
+		VitalsWithStart(func(ctx context.Context, id string) error {
 			startCtx = ctx
 			startID = id
 			return nil
 		}),
-		LifetimeWithEnd(func(ctx context.Context, id string) {
+		VitalsWithEnd(func(ctx context.Context, id string) {
 			endCtx = ctx
 			endID = id
 		}),
@@ -286,7 +286,7 @@ func TestLifetimeManager_ContextPropagation(t *testing.T) {
 }
 
 func TestLifetimeManager_ExecuteWithLifetime_NoLifetime(t *testing.T) {
-	lm := NewLifetimeManager()
+	lm := NewLifetime()
 	defer lm.StopAll()
 
 	var operationCalled atomic.Bool
@@ -304,12 +304,12 @@ func TestLifetimeManager_ExecuteWithLifetime_NoLifetime(t *testing.T) {
 }
 
 func TestLifetimeManager_ExecuteWithLifetime_OperationError(t *testing.T) {
-	lm := NewLifetimeManager()
+	lm := NewLifetime()
 	defer lm.StopAll()
 
 	var timedCalled atomic.Bool
-	lifetime := NewLifetime(
-		LifetimeWithTimed(func(ctx context.Context, id string) {
+	lifetime := NewVitals(
+		VitalsWithTimed(func(ctx context.Context, id string) {
 			timedCalled.Store(true)
 		}, 100*time.Millisecond),
 	)
@@ -332,7 +332,7 @@ func TestLifetimeManager_ExecuteWithLifetime_OperationError(t *testing.T) {
 }
 
 func TestLifetimeManager_ConcurrentScheduleTimed(t *testing.T) {
-	lm := NewLifetimeManager()
+	lm := NewLifetime()
 	defer lm.StopAll()
 
 	var wg sync.WaitGroup
@@ -365,7 +365,7 @@ func TestLifetimeManager_ConcurrentScheduleTimed(t *testing.T) {
 }
 
 func TestLifetimeManager_MultipleResets(t *testing.T) {
-	lm := NewLifetimeManager()
+	lm := NewLifetime()
 	defer lm.StopAll()
 
 	var called atomic.Bool
@@ -397,7 +397,7 @@ func TestLifetimeManager_MultipleResets(t *testing.T) {
 }
 
 func TestLifetimeManager_StopBeforeTimer(t *testing.T) {
-	lm := NewLifetimeManager()
+	lm := NewLifetime()
 
 	var called atomic.Bool
 	lm.ScheduleTimed(context.Background(), "test-stop", func(ctx context.Context, id string) {

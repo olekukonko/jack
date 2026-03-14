@@ -1,4 +1,3 @@
-// async.go - Optimized Future implementation (Final - Hybrid Approach)
 package jack
 
 import (
@@ -11,13 +10,11 @@ import (
 	"time"
 )
 
-// Common errors
 var (
 	ErrFutureCanceled = fmt.Errorf("future was canceled")
 	ErrFutureTimeout  = fmt.Errorf("future timed out")
 )
 
-// resultPool pools result channels to reduce allocations
 var resultPool = sync.Pool{
 	New: func() interface{} {
 		ch := make(chan futureResult, 1)
@@ -25,14 +22,11 @@ var resultPool = sync.Pool{
 	},
 }
 
-// futureResult is the internal result type
 type futureResult struct {
 	val interface{}
 	err error
 }
 
-// Future represents a value that will be available asynchronously.
-// Optimized version uses pooled channels and fast paths for composition.
 type Future[T any] struct {
 	wg       sync.WaitGroup
 	result   T
@@ -46,8 +40,6 @@ type Future[T any] struct {
 	ctx      context.Context
 }
 
-// NewFuture creates a new Future that will execute the provided function.
-// Eager spawn - starts immediately to ensure IsDone works without Await.
 func NewFuture[T any](ctx context.Context, fn func(context.Context) (T, error)) *Future[T] {
 	if fn == nil {
 		f := &Future[T]{done: make(chan struct{})}
@@ -64,7 +56,6 @@ func NewFuture[T any](ctx context.Context, fn func(context.Context) (T, error)) 
 		ctx:  ctx,
 	}
 
-	// Eager spawn required for IsDone() to work without Await()
 	f.wg.Add(1)
 	go f.execute()
 
@@ -74,7 +65,6 @@ func NewFuture[T any](ctx context.Context, fn func(context.Context) (T, error)) 
 func (f *Future[T]) execute() {
 	defer f.wg.Done()
 
-	// Get fn and ctx under lock, then clear for GC
 	f.mu.Lock()
 	fn := f.fn
 	ctx := f.ctx
@@ -82,34 +72,27 @@ func (f *Future[T]) execute() {
 	f.ctx = nil
 	f.mu.Unlock()
 
-	// Ensure done is closed exactly once
 	defer func() {
 		if f.closed.CompareAndSwap(false, true) {
 			close(f.done)
 		}
 	}()
 
-	// Panic recovery
-	defer func() {
-		if r := recover(); r != nil {
-			f.err = &CaughtPanic{Value: r, Stack: debug.Stack()}
-		}
+	var result futureResult
+	done := make(chan struct{})
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				result = futureResult{
+					err: &CaughtPanic{Value: r, Stack: debug.Stack()},
+				}
+			}
+			close(done)
+		}()
+		val, err := fn(ctx)
+		result = futureResult{val: val, err: err}
 	}()
-
-	if err := ctx.Err(); err != nil {
-		f.err = err
-		if err == context.Canceled {
-			f.canceled.Store(true)
-		}
-		return
-	}
-
-	// Get pooled result channel
-	resultChPtr := resultPool.Get().(*chan futureResult)
-	resultCh := *resultChPtr
-
-	// Run function with cancellation support
-	go f.runFuncWithRecovery(fn, ctx, resultCh)
 
 	select {
 	case <-ctx.Done():
@@ -117,37 +100,18 @@ func (f *Future[T]) execute() {
 		if ctx.Err() == context.Canceled {
 			f.canceled.Store(true)
 		}
-		// Drain to prevent goroutine leak
-		select {
-		case <-resultCh:
-		default:
+		<-done // Wait for goroutine to finish
+		// If function completed successfully before context canceled, use result
+		if result.err == nil && result.val != nil {
+			f.result = result.val.(T)
+			f.err = nil
 		}
-	case res := <-resultCh:
-		// Safe type assertion with nil check
-		if res.val != nil {
-			f.result = res.val.(T)
+	case <-done:
+		if result.val != nil {
+			f.result = result.val.(T)
 		}
-		f.err = res.err
+		f.err = result.err
 	}
-
-	// Return channel to pool
-	select {
-	case <-resultCh:
-	default:
-	}
-	resultPool.Put(resultChPtr)
-}
-
-func (f *Future[T]) runFuncWithRecovery(fn func(context.Context) (T, error), ctx context.Context, resultCh chan<- futureResult) {
-	defer func() {
-		if r := recover(); r != nil {
-			resultCh <- futureResult{
-				err: &CaughtPanic{Value: r, Stack: debug.Stack()},
-			}
-		}
-	}()
-	val, err := fn(ctx)
-	resultCh <- futureResult{val: val, err: err}
 }
 
 func (f *Future[T]) Cancel() bool {
@@ -212,7 +176,6 @@ func (f *Future[T]) AwaitWithContext(ctx context.Context) (T, error) {
 	}
 }
 
-// Then chains a transformation. Fast path if already done.
 func (f *Future[T]) Then(ctx context.Context, fn func(T) (any, error)) *Future[any] {
 	select {
 	case <-f.done:
@@ -240,7 +203,6 @@ func (f *Future[T]) Then(ctx context.Context, fn func(T) (any, error)) *Future[a
 	}
 }
 
-// Recover handles errors. Fast path if already done.
 func (f *Future[T]) Recover(ctx context.Context, fn func(error) (T, error)) *Future[T] {
 	select {
 	case <-f.done:
@@ -290,14 +252,12 @@ func WaitAll[T any](futures ...*Future[T]) ([]T, error) {
 	return results, nil
 }
 
-// waitAnyResult is used for the generic channel approach
 type waitAnyResult[T any] struct {
 	index int
 	val   T
 	err   error
 }
 
-// WaitAny - Hybrid: fast path for small N (1 goroutine), reflect for large N
 func WaitAny[T any](futures ...*Future[T]) (int, T, error) {
 	n := len(futures)
 	if n == 0 {
@@ -305,22 +265,18 @@ func WaitAny[T any](futures ...*Future[T]) (int, T, error) {
 		return -1, zero, fmt.Errorf("no futures provided")
 	}
 
-	// Fast path: single future
 	if n == 1 {
 		val, err := futures[0].Await()
 		return 0, val, err
 	}
 
-	// Medium path: 2-8 futures use 1 goroutine (low overhead)
 	if n <= 8 {
 		return waitAnyGeneric(futures...)
 	}
 
-	// Slow path: >8 futures use reflect.Select (scales better, no extra goroutine)
 	return waitAnyReflect(futures...)
 }
 
-// waitAnyGeneric: 1 goroutine + channel, good for small N
 func waitAnyGeneric[T any](futures ...*Future[T]) (int, T, error) {
 	resultCh := make(chan waitAnyResult[T], 1)
 
@@ -341,7 +297,6 @@ func waitAnyGeneric[T any](futures ...*Future[T]) (int, T, error) {
 	return res.index, res.val, res.err
 }
 
-// waitAnyReflect: direct reflect.Select, good for large N
 func waitAnyReflect[T any](futures ...*Future[T]) (int, T, error) {
 	cases := make([]reflect.SelectCase, len(futures))
 	for i, f := range futures {
@@ -355,7 +310,6 @@ func waitAnyReflect[T any](futures ...*Future[T]) (int, T, error) {
 	return chosen, val, err
 }
 
-// Select - Hybrid: fast path for small N, reflect for large N
 func Select[T any](ctx context.Context, futures ...*Future[T]) (int, T, error) {
 	n := len(futures)
 	if n == 0 {
@@ -363,7 +317,6 @@ func Select[T any](ctx context.Context, futures ...*Future[T]) (int, T, error) {
 		return -1, zero, fmt.Errorf("no futures provided")
 	}
 
-	// Fast path: single future with context
 	if n == 1 {
 		select {
 		case <-ctx.Done():
@@ -375,11 +328,9 @@ func Select[T any](ctx context.Context, futures ...*Future[T]) (int, T, error) {
 		}
 	}
 
-	// Medium/Slow path: use reflect (context adds complexity to generic version)
 	return selectReflect(ctx, futures...)
 }
 
-// selectReflect: direct reflect.Select with context
 func selectReflect[T any](ctx context.Context, futures ...*Future[T]) (int, T, error) {
 	cases := make([]reflect.SelectCase, 0, len(futures)+1)
 	cases = append(cases, reflect.SelectCase{

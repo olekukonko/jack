@@ -3,6 +3,7 @@ package jack
 import (
 	"container/heap"
 	"context"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,28 +11,24 @@ import (
 	"github.com/olekukonko/ll"
 )
 
-// ReaperMetrics tracks Reaper operational metrics.
 type ReaperMetrics struct {
-	TouchCalls     atomic.Uint64
-	TouchAtCalls   atomic.Uint64
-	RemoveCalls    atomic.Uint64
-	ClearCalls     atomic.Uint64
-	ExpiredTotal   atomic.Uint64
-	ExpiredHandled atomic.Uint64
-	ExpiredMissed  atomic.Uint64
-	ExpiredErrors  atomic.Uint64
-
-	ActiveTasks    atomic.Int64
-	MaxActiveTasks atomic.Int64
-	TotalTasksSeen atomic.Uint64
-
+	TouchCalls      atomic.Uint64
+	TouchAtCalls    atomic.Uint64
+	RemoveCalls     atomic.Uint64
+	ClearCalls      atomic.Uint64
+	ExpiredTotal    atomic.Uint64
+	ExpiredHandled  atomic.Uint64
+	ExpiredMissed   atomic.Uint64
+	ExpiredErrors   atomic.Uint64
+	ActiveTasks     atomic.Int64
+	MaxActiveTasks  atomic.Int64
+	TotalTasksSeen  atomic.Uint64
 	AvgExpirationMs atomic.Int64
 	MinExpirationMs atomic.Int64
 	MaxExpirationMs atomic.Int64
-
-	LoopIterations atomic.Uint64
-	SignalsSent    atomic.Uint64
-	StopsReceived  atomic.Uint64
+	LoopIterations  atomic.Uint64
+	SignalsSent     atomic.Uint64
+	StopsReceived   atomic.Uint64
 }
 
 func (m *ReaperMetrics) recordTouch() {
@@ -60,10 +57,8 @@ func (m *ReaperMetrics) recordActiveCount(count int) {
 
 func (m *ReaperMetrics) recordExpiration(elapsed time.Duration, handled bool, err error) {
 	m.ExpiredTotal.Add(1)
-
 	elapsedMs := int64(elapsed.Milliseconds())
 
-	// Min
 	for {
 		current := m.MinExpirationMs.Load()
 		if current == 0 || elapsedMs < current {
@@ -75,7 +70,6 @@ func (m *ReaperMetrics) recordExpiration(elapsed time.Duration, handled bool, er
 		}
 	}
 
-	// Max
 	for {
 		current := m.MaxExpirationMs.Load()
 		if elapsedMs > current {
@@ -87,7 +81,6 @@ func (m *ReaperMetrics) recordExpiration(elapsed time.Duration, handled bool, er
 		}
 	}
 
-	// Rolling average
 	for {
 		oldAvg := m.AvgExpirationMs.Load()
 		total := m.ExpiredTotal.Load()
@@ -102,279 +95,24 @@ func (m *ReaperMetrics) recordExpiration(elapsed time.Duration, handled bool, er
 	} else {
 		m.ExpiredMissed.Add(1)
 	}
-
 	if err != nil {
 		m.ExpiredErrors.Add(1)
 	}
 }
 
-// ReaperHandler handles the expiration event for the Reaper.
 type ReaperHandler func(context.Context, string)
 
-// ReaperTask represents a scheduled expiration.
 type ReaperTask struct {
 	ID       string
 	Deadline time.Time
 	index    int
 }
 
-// Reaper manages expiration with full metrics.
-type Reaper struct {
-	mu         sync.Mutex
-	tasks      reaperHeap
-	taskMap    map[string]*ReaperTask
-	handler    ReaperHandler
-	signal     chan struct{}
-	stop       chan struct{}
-	stopped    atomic.Bool
-	defaultTTL time.Duration
-	wg         sync.WaitGroup
-	logger     *ll.Logger
-	metrics    *ReaperMetrics
-}
-
-// ReaperOption configures a Reaper.
-type ReaperOption func(*Reaper)
-
-func ReaperWithLogger(l *ll.Logger) ReaperOption {
-	return func(r *Reaper) {
-		if l != nil {
-			r.logger = l.Namespace("reaper")
-		}
-	}
-}
-
-func ReaperWithHandler(h ReaperHandler) ReaperOption {
-	return func(r *Reaper) {
-		r.handler = h
-	}
-}
-
-// NewReaper creates a new Reaper with metrics.
-func NewReaper(ttl time.Duration, opts ...ReaperOption) *Reaper {
-	r := &Reaper{
-		taskMap:    make(map[string]*ReaperTask),
-		signal:     make(chan struct{}, 1),
-		stop:       make(chan struct{}),
-		defaultTTL: ttl,
-		logger:     logger.Namespace("reaper"),
-		metrics:    &ReaperMetrics{},
-	}
-	heap.Init(&r.tasks)
-	for _, opt := range opts {
-		opt(r)
-	}
-	return r
-}
-
-// Metrics returns the reaper's metrics.
-func (r *Reaper) Metrics() *ReaperMetrics {
-	return r.metrics
-}
-
-func (r *Reaper) Start() {
-	if r.stopped.Load() {
-		return
-	}
-	r.wg.Add(1)
-	go r.loop()
-}
-
-func (r *Reaper) Register(h ReaperHandler) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.handler = h
-}
-
-func (r *Reaper) Touch(id string) {
-	if r.stopped.Load() {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.metrics.recordTouch()
-	deadline := time.Now().Add(r.defaultTTL)
-
-	if task, exists := r.taskMap[id]; exists {
-		task.Deadline = deadline
-		heap.Fix(&r.tasks, task.index)
-	} else {
-		task := &ReaperTask{ID: id, Deadline: deadline}
-		heap.Push(&r.tasks, task)
-		r.taskMap[id] = task
-	}
-
-	r.metrics.recordActiveCount(len(r.taskMap))
-	r.signalLoop()
-}
-
-func (r *Reaper) TouchAt(id string, deadline time.Time) {
-	if r.stopped.Load() {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.metrics.recordTouchAt()
-
-	if task, exists := r.taskMap[id]; exists {
-		task.Deadline = deadline
-		heap.Fix(&r.tasks, task.index)
-		r.logger.Debugf("Reaper.TouchAt: updated task %s to deadline %v", id, deadline)
-	} else {
-		task := &ReaperTask{ID: id, Deadline: deadline}
-		heap.Push(&r.tasks, task)
-		r.taskMap[id] = task
-		r.logger.Debugf("Reaper.TouchAt: added new task %s with deadline %v", id, deadline)
-	}
-
-	r.metrics.recordActiveCount(len(r.taskMap))
-	r.signalLoop()
-}
-
-func (r *Reaper) Remove(id string) bool {
-	if r.stopped.Load() {
-		return false
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.metrics.RemoveCalls.Add(1)
-	removed := r.removeLocked(id)
-	if removed {
-		r.metrics.recordActiveCount(len(r.taskMap))
-		r.logger.Debugf("Reaper.Remove: removed task %s", id)
-	}
-	return removed
-}
-
-func (r *Reaper) Clear() int {
-	if r.stopped.Load() {
-		return 0
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.metrics.ClearCalls.Add(1)
-	count := len(r.taskMap)
-	for id := range r.taskMap {
-		r.removeLocked(id)
-	}
-	r.metrics.recordActiveCount(0)
-	r.logger.Debugf("Reaper.Clear: removed %d tasks", count)
-	return count
-}
-
-func (r *Reaper) Count() int {
-	if r.stopped.Load() {
-		return 0
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.taskMap)
-}
-
-func (r *Reaper) Deadline() (time.Time, bool) {
-	if r.stopped.Load() {
-		return time.Time{}, false
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.tasks.Len() > 0 {
-		return r.tasks[0].Deadline, true
-	}
-	return time.Time{}, false
-}
-
-func (r *Reaper) Stop() {
-	if !r.stopped.CompareAndSwap(false, true) {
-		return
-	}
-	r.metrics.StopsReceived.Add(1)
-	r.logger.Info("Reaper.Stop: initiating shutdown")
-	close(r.stop)
-	r.wg.Wait()
-	r.mu.Lock()
-	r.taskMap = nil
-	r.tasks = nil
-	r.mu.Unlock()
-	r.logger.Info("Reaper.Stop: shutdown complete")
-}
-
-func (r *Reaper) signalLoop() {
-	r.metrics.SignalsSent.Add(1)
-	select {
-	case r.signal <- struct{}{}:
-	default:
-	}
-}
-
-func (r *Reaper) loop() {
-	defer r.wg.Done()
-	r.logger.Info("Reaper.loop: starting background expiration loop")
-	timer := time.NewTimer(0)
-	<-timer.C
-
-	for {
-		r.metrics.LoopIterations.Add(1)
-
-		var sleepDuration time.Duration
-		var hasTasks bool
-		r.mu.Lock()
-		if r.tasks.Len() > 0 {
-			hasTasks = true
-			now := time.Now()
-			earliest := r.tasks[0]
-			if earliest.Deadline.Before(now) || earliest.Deadline.Equal(now) {
-				task := heap.Pop(&r.tasks).(*ReaperTask)
-				delete(r.taskMap, task.ID)
-				r.metrics.recordActiveCount(len(r.taskMap))
-				handler := r.handler
-				r.mu.Unlock()
-
-				start := time.Now()
-				var handleErr error
-				if handler != nil {
-					handler(context.Background(), task.ID)
-				} else {
-					handleErr = context.Canceled
-				}
-				elapsed := time.Since(start)
-
-				r.metrics.recordExpiration(elapsed, handler != nil, handleErr)
-				continue
-			}
-			sleepDuration = earliest.Deadline.Sub(now)
-		}
-		r.mu.Unlock()
-
-		if hasTasks {
-			stopAndDrainTimer(timer)
-			timer.Reset(sleepDuration)
-		} else {
-			stopAndDrainTimer(timer)
-			timer.Reset(time.Hour)
-		}
-
-		select {
-		case <-r.stop:
-			stopAndDrainTimer(timer)
-			return
-		case <-r.signal:
-			stopAndDrainTimer(timer)
-		case <-timer.C:
-		}
-	}
-}
-
-func (r *Reaper) removeLocked(id string) bool {
-	if task, exists := r.taskMap[id]; exists {
-		heap.Remove(&r.tasks, task.index)
-		delete(r.taskMap, id)
-		return true
-	}
-	return false
+type reaperShard struct {
+	items  map[string]*ReaperTask
+	pq     *reaperHeap
+	mu     sync.Mutex
+	wakeCh chan struct{}
 }
 
 type reaperHeap []*ReaperTask
@@ -411,4 +149,331 @@ func (h *reaperHeap) Pop() interface{} {
 	*h = old[:n-1]
 	item.index = -1
 	return item
+}
+
+type Reaper struct {
+	shards     []*reaperShard
+	shardCount uint32
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	minTick    time.Duration
+	timerLimit time.Duration
+	handler    ReaperHandler
+	handlerMu  sync.RWMutex
+	logger     *ll.Logger
+	metrics    *ReaperMetrics
+	stopped    atomic.Bool
+}
+
+type ReaperOption func(*Reaper)
+
+func ReaperWithLogger(l *ll.Logger) ReaperOption {
+	return func(r *Reaper) {
+		if l != nil {
+			r.logger = l.Namespace("reaper")
+		}
+	}
+}
+
+func ReaperWithHandler(h ReaperHandler) ReaperOption {
+	return func(r *Reaper) {
+		r.handler = h
+	}
+}
+
+func ReaperWithShards(count uint32) ReaperOption {
+	return func(r *Reaper) {
+		if count >= 1 && (count&(count-1)) == 0 {
+			r.shardCount = count
+		}
+	}
+}
+
+func ReaperWithMinTick(tick time.Duration) ReaperOption {
+	return func(r *Reaper) {
+		if tick > 0 {
+			r.minTick = tick
+		}
+	}
+}
+
+func ReaperWithTimerLimit(limit time.Duration) ReaperOption {
+	return func(r *Reaper) {
+		if limit > 0 {
+			r.timerLimit = limit
+		}
+	}
+}
+
+func NewReaper(ttl time.Duration, opts ...ReaperOption) *Reaper {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &Reaper{
+		shardCount: 16,
+		ctx:        ctx,
+		cancel:     cancel,
+		minTick:    10 * time.Millisecond,
+		timerLimit: ttl,
+		logger:     logger.Namespace("reaper"),
+		metrics:    &ReaperMetrics{},
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	r.shards = make([]*reaperShard, r.shardCount)
+	for i := uint32(0); i < r.shardCount; i++ {
+		pq := make(reaperHeap, 0)
+		heap.Init(&pq)
+		r.shards[i] = &reaperShard{
+			items:  make(map[string]*ReaperTask),
+			pq:     &pq,
+			wakeCh: make(chan struct{}, 1),
+		}
+		r.wg.Add(1)
+		go r.loop(i)
+	}
+	return r
+}
+
+func (r *Reaper) Metrics() *ReaperMetrics {
+	return r.metrics
+}
+
+// Start is a no-op for backward compatibility. Reaper starts automatically now.
+func (r *Reaper) Start() {}
+
+// Register sets the handler for expired tasks (backward compatible).
+func (r *Reaper) Register(h ReaperHandler) {
+	r.handlerMu.Lock()
+	defer r.handlerMu.Unlock()
+	r.handler = h
+}
+
+func (r *Reaper) getShard(id string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(id))
+	return h.Sum32() & (r.shardCount - 1)
+}
+
+func (r *Reaper) loop(idx uint32) {
+	defer r.wg.Done()
+	s := r.shards[idx]
+	for {
+		s.mu.Lock()
+		var nextDeadline time.Time
+		var hasItem bool
+		if s.pq.Len() > 0 {
+			nextDeadline = (*s.pq)[0].Deadline
+			hasItem = true
+		}
+		s.mu.Unlock()
+
+		if !hasItem {
+			select {
+			case <-r.ctx.Done():
+				return
+			case <-s.wakeCh:
+				continue
+			}
+		}
+
+		now := time.Now()
+		if now.After(nextDeadline) || now.Equal(nextDeadline) {
+			r.processExpired(s)
+			continue
+		}
+
+		wait := nextDeadline.Sub(now)
+		if wait < r.minTick {
+			wait = r.minTick
+		}
+
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-time.After(wait):
+			r.processExpired(s)
+		case <-s.wakeCh:
+			continue
+		}
+	}
+}
+
+func (r *Reaper) processExpired(s *reaperShard) {
+	now := time.Now()
+	s.mu.Lock()
+	expired := make([]*ReaperTask, 0)
+	for s.pq.Len() > 0 {
+		item := (*s.pq)[0]
+		if now.After(item.Deadline) || now.Equal(item.Deadline) {
+			heap.Pop(s.pq)
+			delete(s.items, item.ID)
+			expired = append(expired, item)
+		} else {
+			break
+		}
+	}
+	r.metrics.recordActiveCount(len(s.items))
+	s.mu.Unlock()
+
+	r.handlerMu.RLock()
+	handler := r.handler
+	r.handlerMu.RUnlock()
+
+	for _, item := range expired {
+		start := time.Now()
+		var handleErr error
+		if handler != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), r.timerLimit)
+			handler(ctx, item.ID)
+			cancel()
+		} else {
+			handleErr = context.Canceled
+		}
+		r.metrics.recordExpiration(time.Since(start), handler != nil, handleErr)
+	}
+	r.metrics.LoopIterations.Add(1)
+}
+
+func (r *Reaper) Touch(id string) {
+	if r.stopped.Load() {
+		return
+	}
+	idx := r.getShard(id)
+	s := r.shards[idx]
+	deadline := time.Now().Add(r.timerLimit)
+
+	s.mu.Lock()
+	r.metrics.recordTouch()
+
+	if task, exists := s.items[id]; exists {
+		task.Deadline = deadline
+		heap.Fix(s.pq, task.index)
+	} else {
+		task := &ReaperTask{ID: id, Deadline: deadline}
+		heap.Push(s.pq, task)
+		s.items[id] = task
+	}
+	r.metrics.recordActiveCount(len(s.items))
+	s.mu.Unlock()
+
+	select {
+	case s.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reaper) TouchAt(id string, deadline time.Time) {
+	if r.stopped.Load() {
+		return
+	}
+	idx := r.getShard(id)
+	s := r.shards[idx]
+
+	s.mu.Lock()
+	r.metrics.recordTouchAt()
+
+	if task, exists := s.items[id]; exists {
+		task.Deadline = deadline
+		heap.Fix(s.pq, task.index)
+	} else {
+		task := &ReaperTask{ID: id, Deadline: deadline}
+		heap.Push(s.pq, task)
+		s.items[id] = task
+	}
+	r.metrics.recordActiveCount(len(s.items))
+	s.mu.Unlock()
+
+	select {
+	case s.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reaper) Remove(id string) bool {
+	if r.stopped.Load() {
+		return false
+	}
+	idx := r.getShard(id)
+	s := r.shards[idx]
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r.metrics.RemoveCalls.Add(1)
+	if task, exists := s.items[id]; exists {
+		heap.Remove(s.pq, task.index)
+		delete(s.items, id)
+		r.metrics.recordActiveCount(len(s.items))
+		return true
+	}
+	return false
+}
+
+func (r *Reaper) Clear() int {
+	if r.stopped.Load() {
+		return 0
+	}
+	count := 0
+	for _, s := range r.shards {
+		s.mu.Lock()
+		count += len(s.items)
+		for id := range s.items {
+			task := s.items[id]
+			heap.Remove(s.pq, task.index)
+			delete(s.items, id)
+		}
+		s.mu.Unlock()
+	}
+	r.metrics.ClearCalls.Add(1)
+	r.metrics.recordActiveCount(0)
+	return count
+}
+
+func (r *Reaper) Count() int {
+	if r.stopped.Load() {
+		return 0
+	}
+	count := 0
+	for _, s := range r.shards {
+		s.mu.Lock()
+		count += len(s.items)
+		s.mu.Unlock()
+	}
+	return count
+}
+
+func (r *Reaper) Deadline() (time.Time, bool) {
+	if r.stopped.Load() {
+		return time.Time{}, false
+	}
+	var earliest time.Time
+	found := false
+	for _, s := range r.shards {
+		s.mu.Lock()
+		if s.pq.Len() > 0 {
+			d := (*s.pq)[0].Deadline
+			if !found || d.Before(earliest) {
+				earliest = d
+				found = true
+			}
+		}
+		s.mu.Unlock()
+	}
+	return earliest, found
+}
+
+func (r *Reaper) Stop() {
+	if !r.stopped.CompareAndSwap(false, true) {
+		return
+	}
+	r.metrics.StopsReceived.Add(1)
+	r.cancel()
+	r.wg.Wait()
+	for _, s := range r.shards {
+		s.mu.Lock()
+		s.items = nil
+		s.pq = nil
+		s.mu.Unlock()
+	}
 }

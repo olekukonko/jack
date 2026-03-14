@@ -566,12 +566,3 @@ func TestFuture_ZeroTimeout(t *testing.T) {
 		t.Errorf("Expected zero value, got %v", result)
 	}
 }
-
-func BenchmarkFuture(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		future := Async(func() (int, error) {
-			return i, nil
-		})
-		future.Await()
-	}
-}

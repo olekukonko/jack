@@ -1,4 +1,3 @@
-// doctor.go (your updated version with rolling average fix)
 package jack
 
 import (
