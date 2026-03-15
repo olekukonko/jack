@@ -12,15 +12,23 @@ import (
 )
 
 // Hook defines a lifecycle hook function that returns an error.
+// It accepts a unique identifier string for the operation being tracked.
+// Use this type for pre-execution validation or setup logic that may fail.
 type Hook func(id string) error
 
 // HookCtx defines a context-aware lifecycle hook function that returns an error.
+// It accepts a context for cancellation and an identifier for the tracked operation.
+// Use this type when hooks need to respect timeouts or external cancellation signals.
 type HookCtx func(ctx context.Context, id string) error
 
-// Callback defines a callback function without error return.
+// Callback defines a callback function without error return for post-execution logic.
+// It accepts a unique identifier string for the operation that completed.
+// Use this type for notifications, cleanup, or metrics that do not affect flow control.
 type Callback func(id string)
 
 // CallbackCtx defines a context-aware callback function without error return.
+// It accepts a context for cancellation and an identifier for the completed operation.
+// Use this type when callbacks need to coordinate with context deadlines or values.
 type CallbackCtx func(ctx context.Context, id string)
 
 // LifetimeMetrics tracks operational metrics for the lifetime manager.
@@ -44,19 +52,31 @@ type LifetimeMetrics struct {
 	StopsReceived   atomic.Uint64
 }
 
+// recordSchedule increments schedule-related counters for metrics tracking.
+// It atomically updates both the total schedule calls and total timers seen.
+// This method is called internally when a new timer is successfully scheduled.
 func (m *LifetimeMetrics) recordSchedule() {
 	m.ScheduleCalls.Add(1)
 	m.TotalTimersSeen.Add(1)
 }
 
+// recordReset increments the reset calls counter for metrics tracking.
+// It atomically updates the metric to reflect a timer reset operation.
+// This method is called internally when an existing timer is refreshed.
 func (m *LifetimeMetrics) recordReset() {
 	m.ResetCalls.Add(1)
 }
 
+// recordCancel increments the cancel calls counter for metrics tracking.
+// It atomically updates the metric to reflect a timer cancellation operation.
+// This method is called internally when a scheduled timer is explicitly cancelled.
 func (m *LifetimeMetrics) recordCancel() {
 	m.CancelCalls.Add(1)
 }
 
+// recordActiveCount updates active timer counters with atomic safety for concurrency.
+// It tracks both current active timers and the historical maximum observed count.
+// This method is called after any queue modification to maintain accurate metrics.
 func (m *LifetimeMetrics) recordActiveCount(count int) {
 	m.ActiveTimers.Store(int64(count))
 	for {
@@ -71,6 +91,9 @@ func (m *LifetimeMetrics) recordActiveCount(count int) {
 	}
 }
 
+// recordExpiration updates expiration statistics including timing and outcome metrics.
+// It atomically calculates rolling averages and tracks min/max expiration durations.
+// This method records whether the expiration was handled successfully and any errors.
 func (m *LifetimeMetrics) recordExpiration(elapsed time.Duration, handled bool, err error) {
 	m.ExpiredTotal.Add(1)
 	elapsedMs := int64(elapsed.Milliseconds())
@@ -170,6 +193,9 @@ type Lifetime struct {
 
 type LifetimeOption func(*Lifetime)
 
+// LifetimeWithShards configures the number of shards for concurrent timer management.
+// The count must be a power of two for efficient bitwise modulo hashing distribution.
+// Use higher shard counts to reduce lock contention under heavy timer scheduling load.
 func LifetimeWithShards(count uint32) LifetimeOption {
 	return func(lm *Lifetime) {
 		if count >= 1 && (count&(count-1)) == 0 {
@@ -178,6 +204,9 @@ func LifetimeWithShards(count uint32) LifetimeOption {
 	}
 }
 
+// LifetimeWithMinTick sets the minimum polling interval for the expiration check loop.
+// If the provided duration is zero or negative, the option is ignored and default applies.
+// Use this to balance responsiveness against CPU usage when processing expired timers.
 func LifetimeWithMinTick(tick time.Duration) LifetimeOption {
 	return func(lm *Lifetime) {
 		if tick > 0 {
@@ -186,6 +215,9 @@ func LifetimeWithMinTick(tick time.Duration) LifetimeOption {
 	}
 }
 
+// LifetimeWithTimerLimit configures the maximum execution time allowed for timer callbacks.
+// If the provided duration is zero or negative, the option is ignored and default applies.
+// This prevents long-running callbacks from blocking the expiration processing loop.
 func LifetimeWithTimerLimit(limit time.Duration) LifetimeOption {
 	return func(lm *Lifetime) {
 		if limit > 0 {
@@ -194,6 +226,9 @@ func LifetimeWithTimerLimit(limit time.Duration) LifetimeOption {
 	}
 }
 
+// LifetimeWithLogger assigns a namespaced logger instance for structured Lifetime operation logging.
+// If the provided logger is nil, the option has no effect and the default logger remains active.
+// Use this to integrate Lifetime logs with your application's logging infrastructure and levels.
 func LifetimeWithLogger(l *ll.Logger) LifetimeOption {
 	return func(lm *Lifetime) {
 		if l != nil {
@@ -202,6 +237,9 @@ func LifetimeWithLogger(l *ll.Logger) LifetimeOption {
 	}
 }
 
+// NewLifetime creates and initializes a new Lifetime manager with the provided configuration options.
+// It spawns one pruning goroutine per shard to handle timer expiration with minimal lock contention.
+// The returned Lifetime is immediately active and ready to schedule timed callbacks via ScheduleTimed.
 func NewLifetime(opts ...LifetimeOption) *Lifetime {
 	ctx, cancel := context.WithCancel(context.Background())
 	lm := &Lifetime{
@@ -231,16 +269,25 @@ func NewLifetime(opts ...LifetimeOption) *Lifetime {
 	return lm
 }
 
+// Metrics returns a reference to the Lifetime manager's metrics struct for monitoring operational statistics.
+// All metric fields use atomic operations, allowing safe concurrent reads without additional locking.
+// Use this to expose timer scheduling statistics to dashboards, alerts, or external monitoring systems.
 func (lm *Lifetime) Metrics() *LifetimeMetrics {
 	return lm.metrics
 }
 
+// getShard computes the shard index for a given ID using FNV-32a hashing and bitwise masking.
+// It ensures uniform distribution of timers across shards when shardCount is a power of two.
+// This method is called internally to route timer operations to the correct concurrent shard.
 func (lm *Lifetime) getShard(id string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(id))
 	return h.Sum32() & (lm.shardCount - 1)
 }
 
+// pruneLoop runs the background goroutine that processes expired timers for a specific shard.
+// It efficiently waits for the next expiry or wake signal, then processes all due items in batch.
+// The loop terminates cleanly when the context is cancelled, ensuring no goroutine leaks.
 func (lm *Lifetime) pruneLoop(idx uint32) {
 	defer lm.wg.Done()
 	s := lm.shards[idx]
@@ -285,6 +332,9 @@ func (lm *Lifetime) pruneLoop(idx uint32) {
 	}
 }
 
+// processExpired extracts and executes all timers that have reached their expiration time.
+// It runs each callback with a timeout context and records metrics for duration and outcome.
+// This method holds the shard lock only during queue extraction to minimize contention.
 func (lm *Lifetime) processExpired(s *shard) {
 	now := time.Now()
 	s.mu.Lock()
@@ -312,6 +362,9 @@ func (lm *Lifetime) processExpired(s *shard) {
 	lm.metrics.LoopIterations.Add(1)
 }
 
+// ScheduleTimed registers a callback to execute after the specified wait duration for a given ID.
+// If a timer already exists for the ID, it is replaced with the new callback and expiration time.
+// The method uses sharding for concurrency and signals the prune loop to re-evaluate scheduling.
 func (lm *Lifetime) ScheduleTimed(ctx context.Context, id string, callback CallbackCtx, wait time.Duration) {
 	if callback == nil {
 		return
@@ -350,6 +403,9 @@ func (lm *Lifetime) ScheduleTimed(ctx context.Context, id string, callback Callb
 	}
 }
 
+// ScheduleLifetimeTimed schedules a timed callback using configuration from a Vitals instance.
+// If the Vitals or its Timed callback is nil, it resets any existing timer for the ID instead.
+// This convenience method integrates Lifetime timer management with Vitals lifecycle configuration.
 func (lm *Lifetime) ScheduleLifetimeTimed(ctx context.Context, id string, lifetime *Vitals) {
 	if lifetime == nil || lifetime.Timed == nil {
 		lm.ResetTimed(id)
@@ -358,6 +414,9 @@ func (lm *Lifetime) ScheduleLifetimeTimed(ctx context.Context, id string, lifeti
 	lm.ScheduleTimed(ctx, id, lifetime.Timed, lifetime.TimedWait)
 }
 
+// ExecuteWithLifetime runs an operation with Vitals hooks and schedules a timed callback on success.
+// If the operation succeeds and a timed callback is configured, it is scheduled for later execution.
+// This method combines immediate operation execution with deferred lifecycle callback management.
 func (lm *Lifetime) ExecuteWithLifetime(ctx context.Context, id string, lifetime *Vitals, operation Func) error {
 	if lifetime == nil {
 		return operation()
@@ -369,6 +428,9 @@ func (lm *Lifetime) ExecuteWithLifetime(ctx context.Context, id string, lifetime
 	return err
 }
 
+// ExecuteCtxWithLifetime runs a context-aware operation with Vitals hooks and schedules timed callback on success.
+// If the operation succeeds and a timed callback is configured, it is scheduled for later execution.
+// This method combines immediate context-aware execution with deferred lifecycle callback management.
 func (lm *Lifetime) ExecuteCtxWithLifetime(ctx context.Context, id string, lifetime *Vitals, operation FuncCtx) error {
 	if lifetime == nil {
 		return operation(ctx)
@@ -380,6 +442,9 @@ func (lm *Lifetime) ExecuteCtxWithLifetime(ctx context.Context, id string, lifet
 	return err
 }
 
+// ResetTimed extends the expiration time of an existing timer by its original duration from now.
+// It returns true if the timer was found and successfully reset, false if no timer existed for the ID.
+// This method is useful for implementing keep-alive or activity-based timeout extension patterns.
 func (lm *Lifetime) ResetTimed(id string) bool {
 	idx := lm.getShard(id)
 	s := lm.shards[idx]
@@ -399,6 +464,9 @@ func (lm *Lifetime) ResetTimed(id string) bool {
 	return false
 }
 
+// CancelTimed removes a scheduled timer by ID, preventing its callback from executing.
+// It returns true if the timer was found and successfully cancelled, false if none existed.
+// This method is safe to call multiple times and has no effect if the timer already expired.
 func (lm *Lifetime) CancelTimed(id string) bool {
 	idx := lm.getShard(id)
 	s := lm.shards[idx]
@@ -415,6 +483,9 @@ func (lm *Lifetime) CancelTimed(id string) bool {
 	return false
 }
 
+// StopAll gracefully shuts down the Lifetime manager, cancelling all pending timers and goroutines.
+// It signals the context to stop prune loops, waits for them to exit, then clears all shard state.
+// After calling StopAll, the Lifetime instance cannot be reused and all scheduled callbacks are discarded.
 func (lm *Lifetime) StopAll() {
 	lm.metrics.StopsReceived.Add(1)
 	lm.cancel()
@@ -429,6 +500,9 @@ func (lm *Lifetime) StopAll() {
 	lm.metrics.recordActiveCount(0)
 }
 
+// HasPending checks whether a timer is currently scheduled for the given ID.
+// It returns true if the ID exists in any shard's queue, false otherwise.
+// This method provides thread-safe read access without modifying internal state.
 func (lm *Lifetime) HasPending(id string) bool {
 	idx := lm.getShard(id)
 	s := lm.shards[idx]
@@ -438,6 +512,9 @@ func (lm *Lifetime) HasPending(id string) bool {
 	return exists
 }
 
+// PendingCount returns the total number of timers currently scheduled across all shards.
+// It iterates through each shard while holding locks to ensure an accurate snapshot count.
+// Use this for monitoring queue depth or implementing backpressure in high-load scenarios.
 func (lm *Lifetime) PendingCount() int {
 	count := 0
 	for _, s := range lm.shards {
@@ -448,6 +525,9 @@ func (lm *Lifetime) PendingCount() int {
 	return count
 }
 
+// GetRemainingDuration returns the time remaining until a scheduled timer expires for the given ID.
+// It returns the duration and true if the timer exists and has not yet expired, otherwise zero and false.
+// This method is useful for displaying countdowns or making scheduling decisions based on timer state.
 func (lm *Lifetime) GetRemainingDuration(id string) (time.Duration, bool) {
 	idx := lm.getShard(id)
 	s := lm.shards[idx]
@@ -465,7 +545,9 @@ func (lm *Lifetime) GetRemainingDuration(id string) (time.Duration, bool) {
 	return remaining, true
 }
 
-// Stop stops timers for the given IDs. If no IDs are provided, stops all timers.
+// Stop cancels timers for the specified IDs, or all timers if no IDs are provided.
+// It groups IDs by shard for efficient batch removal and signals prune loops to re-evaluate.
+// This method provides a convenient way to clean up multiple timers without individual CancelTimed calls.
 func (lm *Lifetime) Stop(ids ...string) {
 	if len(ids) == 0 {
 		lm.StopAll()
