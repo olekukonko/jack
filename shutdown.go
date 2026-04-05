@@ -167,7 +167,7 @@ func (sm *Shutdown) forceQuitMonitor(timeout time.Duration) {
 
 // Register adds a cleanup task.
 // Supported types:
-//   - func(), func() error, func(context.Context) error, io.Closer
+// func(), func() error, func(context.Context) error, io.Closer
 //
 // Automatically wraps panics into structured errors and tracks stats.
 func (sm *Shutdown) Register(fn any) error {

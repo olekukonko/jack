@@ -57,6 +57,71 @@ func TestLooperImmediate(t *testing.T) {
 	}
 }
 
+// TestLooperImmediate_NoDoubleExecute proves bug fix 2: with the original code,
+// Immediate=true caused the callback to fire twice before the first ticker
+// interval — once in Start() and again at the top of run(). The fix moves the
+// execute() call exclusively to Start(), and run() skips it.
+func TestLooperImmediate_NoDoubleExecute(t *testing.T) {
+	var counter atomic.Int32
+
+	looper := NewLooper(
+		func() error {
+			counter.Add(1)
+			return nil
+		},
+		WithLooperInterval(10*time.Second), // long interval — only immediate fires
+		WithLooperImmediate(true),
+	)
+
+	looper.Start()
+
+	// Give run() goroutine time to start and (if buggy) execute again.
+	time.Sleep(50 * time.Millisecond)
+	looper.Stop()
+
+	// Exactly 1 execution: the immediate one in Start().
+	// With the bug this would be 2.
+	if n := counter.Load(); n != 1 {
+		t.Errorf("expected exactly 1 execution with Immediate=true before first tick, got %d", n)
+	}
+}
+
+// TestLooperImmediate_StopFromCallback proves bug fix 1: with the original
+// code, a callback that called Stop() while Immediate=true triggered a
+// wg.Add(1) / wg.Wait() data race detected by -race. The fix ensures
+// wg.Add(1) happens before execute() so Stop()'s wg.Wait() always sees a
+// non-zero counter.
+//
+// Run with: go test -race -run TestLooperImmediate_StopFromCallback
+func TestLooperImmediate_StopFromCallback(t *testing.T) {
+	done := make(chan struct{})
+
+	var looper *Looper
+	looper = NewLooper(
+		func() error {
+			// Self-stopping callback: simulates a one-shot job that calls
+			// Stop() as soon as it completes. This is the pattern that
+			// triggered the wg race in the original code.
+			go func() {
+				looper.Stop()
+				close(done)
+			}()
+			return nil
+		},
+		WithLooperInterval(10*time.Second),
+		WithLooperImmediate(true),
+	)
+
+	looper.Start()
+
+	select {
+	case <-done:
+		// Stop completed without deadlock or race.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() from callback deadlocked or timed out")
+	}
+}
+
 func TestLooperBackoff(t *testing.T) {
 	var counter atomic.Int32
 	failUntil := int32(3)

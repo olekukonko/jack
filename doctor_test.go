@@ -1,4 +1,3 @@
-// doctor_test.go
 package jack
 
 import (

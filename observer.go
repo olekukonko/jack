@@ -70,10 +70,10 @@ type eventObservable[T any] struct {
 // It optionally accepts the number of worker goroutines for asynchronous notifications (defaults to 5 if not provided or invalid).
 // Workers process notifications in parallel to avoid blocking the notifier, with panic recovery for observer errors.
 // Parameters:
-//   - numNotifyWorkers: Optional number of worker goroutines (positive integer). If not provided or invalid, defaults to 5.
+// numNotifyWorkers: Optional number of worker goroutines (positive integer). If not provided or invalid, defaults to 5.
 //
 // Returns:
-//   - Observable[T]: A new Observable instance ready to accept observers and events.
+// Observable[T]: A new Observable instance ready to accept observers and events.
 //
 // Example:
 //
@@ -129,7 +129,7 @@ func (o *eventObservable[T]) process() {
 // Add registers one or more observers to receive future notifications.
 // It uses a write lock to safely append to the observer list, ensuring thread-safety for concurrent access.
 // Parameters:
-//   - observers: Variadic list of Observer[T] instances to register.
+// observers: Variadic list of Observer[T] instances to register.
 //
 // Example:
 //
@@ -150,7 +150,7 @@ func (o *eventObservable[T]) Add(observers ...Observer[T]) {
 // It uses a map for efficient lookup and rebuilds the observer list without the removed ones.
 // This ensures all instances are removed even if duplicates exist, and is thread-safe.
 // Parameters:
-//   - observers: Variadic list of Observer[T] instances to unregister.
+// observers: Variadic list of Observer[T] instances to unregister.
 //
 // Example:
 //
@@ -180,7 +180,7 @@ func (o *eventObservable[T]) Remove(observers ...Observer[T]) {
 // It takes a snapshot of observers to avoid issues if the list changes during notification.
 // If shutdown is initiated mid-notification, remaining jobs are dropped with a log message.
 // Parameters:
-//   - events: Variadic list of events of type T to send to all observers.
+// events: Variadic list of events of type T to send to all observers.
 //
 // Example:
 //

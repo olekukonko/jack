@@ -84,14 +84,14 @@ func TestShutdownLIFO(t *testing.T) {
 	var order []string
 	var mu sync.Mutex
 
-	// 1. Registered First
+	// Registered First
 	_ = sm.Register(func() {
 		mu.Lock()
 		order = append(order, "first")
 		mu.Unlock()
 	})
 
-	// 2. Registered Second
+	// Registered Second
 	_ = sm.Register(func() {
 		mu.Lock()
 		order = append(order, "second")
@@ -162,15 +162,15 @@ func TestShutdownPanicRecovery(t *testing.T) {
 func TestShutdownTypes(t *testing.T) {
 	sm := NewShutdown()
 
-	// 1. func()
+	// func()
 	sm.Register(func() {})
-	// 2. func() error (jack.Func)
+	// func() error (jack.Func)
 	sm.Register(func() error { return nil })
-	// 3. func(context.Context) error (jack.FuncCtx)
+	// func(context.Context) error (jack.FuncCtx)
 	sm.RegisterWithContext("ctx", func(ctx context.Context) error { return nil })
-	// 4. io.Closer
+
 	sm.Register(&fakeCloser{})
-	// 5. Explicit jack.Func
+	// Explicit jack.Func
 	sm.Register(Func(func() error { return nil }))
 
 	sm.executeShutdown()

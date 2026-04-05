@@ -100,6 +100,7 @@ func Logger() *ll.Logger {
 type Routine struct {
 	Interval time.Duration // Interval between task executions
 	MaxRuns  int           // Maximum number of runs (0 for unlimited)
+	Cron     string        // Cron expression (e.g., "0 0 * * *" for daily at midnight, "@every 1m")
 }
 
 // Package jack provides utilities for safe, context-aware function execution with mutex protection.

@@ -225,11 +225,13 @@ func (l *Looper) Start() {
 	}
 	l.logger.Info("looper starting (interval=%v, jitter=%.2f, backoff=%v)",
 		l.config.Interval, l.config.Jitter, l.config.Backoff)
+
+	l.wg.Add(1)
+	go l.run()
+
 	if l.config.Immediate {
 		l.execute()
 	}
-	l.wg.Add(1)
-	go l.run()
 }
 
 func (l *Looper) Stop() {
@@ -284,12 +286,12 @@ func (l *Looper) run() {
 			l.logger.Error("looper panic: %v\n%s", r, debug.Stack())
 		}
 	}()
-	if l.config.Immediate {
-		l.execute()
-	} else {
+
+	if !l.config.Immediate {
 		l.sleep(l.calculateInterval(l.CurrentInterval()))
 		l.execute()
 	}
+
 	ticker := time.NewTicker(l.calculateInterval(l.CurrentInterval()))
 	defer ticker.Stop()
 	for {
