@@ -1,256 +1,185 @@
 # Jack
 
-Jack is a robust Go package for managing concurrent and asynchronous task execution. It provides a worker pool, task schedulers, runners, debouncers, mutex utilities, and observability tools to build scalable, reliable systems. Whether you're handling background jobs, rate-limiting function calls, or coordinating goroutines with context awareness and panic recovery, Jack simplifies concurrency while ensuring thread-safety, error handling, and monitoring.
+**Production-grade concurrency toolkit for Go**
 
-### Why Use Jack?
-- **Simplify Concurrency**: Manage worker pools, schedulers, and groups without boilerplate for channels, wait groups, or error propagation.
-- **Robustness**: Built-in panic recovery, context cancellation, timeouts, and retry mechanisms prevent crashes and handle failures gracefully.
-- **Observability**: Track task lifecycles (queued, running, done) with customizable event notifications for logging, metrics, or monitoring.
-- **Flexibility**: Supports simple tasks, context-aware tasks, debouncing, and scheduling with intervals or limits.
-- **Performance**: Efficient, lightweight design with configurable queues, workers, and backoffs for high-throughput applications.
+Jack provides the missing pieces for building robust, observable concurrent systems. No magic, no reflection hacks—just solid patterns you'd otherwise write yourself.
 
-Ideal for web servers, ETL pipelines, real-time systems, or any app needing reliable async processing.
+## Why This Exists
 
-## Features
-- **Worker Pool**: Fixed-size goroutine pool for concurrent task execution with queueing and backpressure handling.
-- **Runner**: Single-worker async queue for sequential task processing.
-- **Scheduler**: Periodic or limited task submission to pools with retries on failures.
-- **Group**: Coordinate multiple goroutines with error collection, limits, and context support.
-- **Debouncer**: Group rapid function calls, executing only after inactivity or thresholds (e.g., for API rate-limiting).
-- **Mutex Utilities**: Safe, context-aware locking with panic recovery and timeouts.
-- **Observable**: Event-driven notifications for task events, extensible with custom observers.
-- **Task Types**: Support for `Task` (simple), `TaskCtx` (context-aware), and `Identifiable` (custom IDs).
-- **Error Handling**: Captures panics as `CaughtPanic` errors with optional stack traces.
-- **Logging**: Integrated with a namespaced logger for detailed tracing.
-- **Lifetime Hooks**: Add start/end/timed callbacks to operations for setup/cleanup or timeouts.
-- **Reaper**: Efficient expiration tracking for items (e.g., cache TTL) using min-heap, with handlers on expiry.
-- **Shutdown Manager**: Registers cleanup hooks (funcs, closers) for graceful exit on signals or triggers, with stats.
+Go's concurrency primitives are excellent, but production systems need more:
+- Panic recovery that doesn't crash your entire process
+- Backpressure when queues fill up
+- Visibility into what your goroutines are actually doing
+- Graceful shutdown that finishes in-flight work
+- Health checks that degrade and accelerate automatically
 
-## Installation
-```bash
-go get github.com/olekukonko/jack
-```
+Jack fills these gaps without getting in your way.
 
-## Quick Start
-Here's a simple worker pool executing tasks concurrently:
+## What's Inside
+
+### Pool
+Fixed-size worker pool with backpressure. Tasks queue when workers are busy. Submissions fail fast when the queue is full.
 
 ```go
-package main
-
-import (
-    "fmt"
-    "time"
-    "github.com/olekukonko/jack"
-)
-
-func main() {
-    // Create a pool with 2 workers and a queue size of 10
-    pool := jack.NewPool(2, jack.PoolingWithQueueSize(10))
-    defer pool.Shutdown(5 * time.Second) // Graceful shutdown
-
-    // Submit a simple task
-    err := pool.Submit(jack.Func(func() error {
-        fmt.Println("Task executed!")
-        return nil
-    }))
-    if err != nil {
-        fmt.Printf("Error: %v\n", err)
-    }
-
-    time.Sleep(time.Second) // Wait for execution
-}
+pool := jack.NewPool(5, jack.PoolingWithQueueSize(100))
+pool.Submit(jack.Func(func() error {
+    // work
+    return nil
+}))
 ```
 
-Run it, and you'll see the task output. Scale by adding more tasks or workers!
-
-## Detailed Usage
-
-### Worker Pool (`Pool`)
-Manages concurrent task execution.
+### Future/Promise
+Type-safe async computation with composition. Wait for results, chain transformations, recover from errors.
 
 ```go
-// With observability
-obs := jack.NewObservable[jack.Event]()
-obs.Add(&logObserver{}) // Custom observer implementing Observer[Event]
+f := jack.Async(func() (string, error) {
+    return fetchUser()
+})
 
-pool := jack.NewPool(5, 
-    jack.PoolingWithQueueSize(20),
-    jack.PoolingWithObservable(obs),
-    jack.PoolingWithIDGenerator(customIDFunc),
-)
-
-// Submit multiple tasks
-pool.Submit(jack.Func(func() error { /* work */ return nil }))
-pool.SubmitCtx(ctx, jack.FuncCtx(func(ctx context.Context) error { /* work with ctx */ return nil }))
-
-// Monitor
-fmt.Println("Queue size:", pool.QueueSize())
-fmt.Println("Workers:", pool.Workers())
+f.Then(ctx, func(user string) (any, error) {
+    return fetchProfile(user)
+}).Await()
 ```
 
-### Runner (`Runner`)
-For async, sequential task processing.
+### Doctor
+Health check scheduler that degrades and accelerates. Tracks consecutive failures, applies jitter, notifies observers.
 
 ```go
-runner := jack.NewRunner(
-    jack.WithRunnerQueueSize(15),
-    jack.WithRunnerObservable(obs),
-)
-
-runner.Do(jack.Func(func() error { /* task */ return nil }))
-runner.DoCtx(ctx, jack.FuncCtx(func(ctx context.Context) error { /* task */ return nil }))
-
-defer runner.Shutdown(5 * time.Second)
+doctor := jack.NewDoctor(jack.DoctorWithMaxConcurrent(10))
+doctor.Add(jack.NewPatient(jack.PatientConfig{
+    ID:          "database",
+    Interval:    10 * time.Second,
+    MaxFailures: 3,
+    Check:       checkDB,
+    OnStateChange: func(e jack.PatientEvent) {
+        if e.State == jack.PatientFailed {
+            triggerAlert(e.ID)
+        }
+    },
+}))
 ```
 
-### Scheduler (`Scheduler`)
-Schedules tasks periodically or with limits.
-
-```go
-scheduler, err := jack.NewScheduler("my-scheduler", pool, jack.Routine{Interval: time.Second * 2, MaxRuns: 5},
-    jack.SchedulingWithObservable(scheduleObs),
-    jack.SchedulingWithRetry(5, time.Millisecond * 200),
-)
-if err != nil { /* handle */ }
-
-scheduler.Do(jack.Func(func() error { fmt.Println("Scheduled!"); return nil }))
-
-// Or context-aware
-scheduler.DoCtx(ctx, jack.FuncCtx(func(ctx context.Context) error { /* ... */ return nil }))
-
-// Stop later
-scheduler.Stop()
-```
-
-### Group (`Group`)
-Coordinates concurrent functions with error handling.
-
-```go
-group := jack.NewGroup().WithContext(ctx).WithLimit(3) // Limit to 3 concurrent
-
-group.Go(func() error { /* goroutine 1 */ return nil })
-group.GoCtx(func(ctx context.Context) error { /* goroutine 2 */ return nil })
-
-go func() {
-    for err := range group.Errors() {
-        fmt.Printf("Error: %v\n", err)
-    }
-}()
-
-group.Wait() // Block until done
-```
-
-Standalone `Go` for single functions:
-```go
-errCh := jack.Go(func() error { /* may panic or error */ return nil })
-err := <-errCh // Receive error or nil
-```
-
-### Debouncer (`Debouncer`)
-Groups rapid calls, executes after delay or thresholds.
+### Debouncer
+Rate-limit rapid calls. Execute only after a quiet period or when thresholds are hit.
 
 ```go
 db := jack.NewDebouncer(
-    jack.WithDebounceDelay(time.Millisecond * 500),
+    jack.WithDebounceDelay(500*time.Millisecond),
     jack.WithDebounceMaxCalls(10),
-    jack.WithDebounceMaxWait(time.Second * 2),
 )
-
-db.Do(func() { fmt.Println("Debounced execution"); }) // Call multiple times, executes once after delay
-
-db.Cancel() // Stop pending
-db.Flush()  // Execute immediately
+db.Do(expensiveOperation)
 ```
 
-### Safely Utilities (`Safely`)
-Safe locking with context and panic support.
+### Looper
+Background task with exponential backoff and jitter. Perfect for reconciliation loops.
 
 ```go
-var mu jack.Safely
-
-mu.Do(func() { /* critical section */ })
-
-err := mu.Safe(func() error { /* may panic */ return nil })
-if cp, ok := err.(*jack.CaughtPanic); ok {
-    fmt.Printf("Panic: %v\nStack: %s\n", cp.Val, cp.Stack)
-}
-
-err = mu.SafeCtx(ctx, func() error { time.Sleep(time.Second); return nil }) // Supports timeouts
-```
-
-Standalone versions: `jack.Safe`, `jack.SafeCtx`, etc.
-
-### Observable and Observers
-For event notifications.
-
-```go
-obs := jack.NewObservable[string](3) // 3 workers for notifications
-defer obs.Shutdown()
-
-obs.Add(&myObserver{}) // Implements Observer[string]
-obs.Notify("Event1", "Event2")
-obs.Remove(&myObserver{})
-```
-
-Use with Pool/Scheduler/Runner for task events.
-
-### Lifetime Hooks
-```go
-lifetime := jack.NewLifetime(
-    jack.LifetimeWithStart(func(ctx context.Context, id string) error { /* setup */ return nil }),
-    jack.LifetimeWithEnd(func(ctx context.Context, id string) { /* cleanup */ }),
-    jack.LifetimeWithTimed(func(ctx context.Context, id string) { /* timeout */ }, time.Minute),
+looper := jack.NewLooper(reconcile,
+    jack.WithLooperInterval(5*time.Second),
+    jack.WithLooperBackoff(true),
+    jack.WithLooperMaxInterval(time.Minute),
 )
-err := lifetime.Execute(ctx, "op1", jack.Func(func() error { /* operation */ return nil }))
+looper.Start()
+```
 
-// Manager for multiple lifetimes
-lm := jack.NewLifetimeManager()
-defer lm.Stop()
-lm.ExecuteWithLifetime(ctx, "op2", lifetime, jack.Func(func() error { /* ... */ return nil }))
-lm.ResetTimed("op2") // Keep-alive
+### Shutdown
+Graceful termination with signal handling. Register cleanup in LIFO order.
+
+```go
+sd := jack.NewShutdown(jack.ShutdownWithTimeout(30*time.Second))
+sd.Register(db.Close)
+sd.Register(cache.Flush)
+sd.Wait() // blocks until SIGTERM
 ```
 
 ### Reaper
-```go
-reaper := jack.NewReaper(time.Minute, jack.ReaperWithHandler(func(ctx context.Context, id string) { /* on expire */ }))
-reaper.Start()
-defer reaper.Stop()
+TTL expiration with min-heap and sharding.
 
-reaper.Touch("item1") // Schedule with default TTL
-reaper.TouchAt("item2", time.Now().Add(time.Second*30)) // Custom deadline
-reaper.Remove("item1") // Cancel
+```go
+reaper := jack.NewReaper(5*time.Minute,
+    jack.ReaperWithHandler(func(ctx context.Context, id string) {
+        cleanup(id)
+    }),
+)
+reaper.Touch("session-123")
 ```
 
-### Shutdown Manager
-```go
-shutdown := jack.NewShutdown(jack.ShutdownWithTimeout(time.Second*10), jack.ShutdownConcurrent())
-shutdown.RegisterFunc("cleanup", func() { /* cleanup */ })
-shutdown.RegisterCloser("db", dbCloser)
-shutdown.RegisterWithContext("ctx-task", jack.FuncCtx(func(ctx context.Context) error { /* ... */ return nil }))
+### Lifetime
+Scheduled callbacks with keep-alive resets.
 
-stats := shutdown.Wait() // Blocks until signal; returns stats
-fmt.Printf("Completed: %d, Failed: %d\n", stats.CompletedEvents, stats.FailedEvents)
+```go
+lm := jack.NewLifetime()
+lm.ScheduleTimed(ctx, "heartbeat", func(ctx context.Context, id string) {
+    markDead(id)
+}, 30*time.Second)
+lm.ResetTimed("heartbeat") // extend on activity
 ```
 
-## API Reference
-- **Types**: `Task`, `TaskCtx`, `Identifiable`, `Event`, `Schedule`, `Routine`, `CaughtPanic`.
-- **Functions**: `NewPool`, `NewRunner`, `NewScheduler`, `NewDebouncer`, `NewObservable`, `NewGroup`, `Go`, `Safe`, `SafeCtx`, etc.
-- **Options**: `PoolingWith...`, `WithRunner...`, `SchedulingWith...`, `WithDebounce...`.
+### Runner, Scheduler, Group
+Single-worker queue, cron-style scheduling, and coordinated goroutine groups with error collection.
 
-See godoc for full details.
+### Safely
+Context-aware mutex with panic recovery.
+
+```go
+var mu jack.Safely
+err := mu.SafeCtx(ctx, func() error {
+    // critical section that respects context cancellation
+    return nil
+})
+```
+
+## Observability
+
+Every component emits events you can hook into:
+
+```go
+obs := jack.NewObservable[jack.Event](10)
+obs.Add(myObserver)
+
+pool := jack.NewPool(5, jack.PoolingWithObservable(obs))
+```
+
+Doctor, Scheduler, and Looper have their own event types for metrics and alerting.
+
+## Error Handling
+
+Panics become `*jack.CaughtPanic` with stack traces. No silent failures.
+
+```go
+err := jack.Safe(func() error {
+    panic("boom")
+})
+if cp, ok := err.(*jack.CaughtPanic); ok {
+    log.Printf("panic: %v\n%s", cp.Value, cp.Stack)
+}
+```
+
+## When To Use What
+
+| Problem | Use |
+|---------|-----|
+| Process many independent tasks concurrently | `Pool` |
+| Need result from async operation | `Future` |
+| Run periodic health checks with degradation | `Doctor` |
+| Rate-limit bursty calls | `Debouncer` |
+| Background loop with backoff | `Looper` |
+| Graceful shutdown with cleanup ordering | `Shutdown` |
+| Expire items after TTL | `Reaper` |
+| Schedule callbacks with keep-alive | `Lifetime` |
+| Coordinate multiple goroutines, collect errors | `Group` |
+| Sequential async processing | `Runner` |
+| Cron-style recurring tasks | `Scheduler` |
+| Safe locking with timeouts | `Safely` |
 
 ## Testing
-Run comprehensive tests:
+
 ```bash
-go test -v ./...
+go test -v -race ./...
 ```
 
-## Dependencies
-- `github.com/oklog/ulid/v2`: Unique IDs.
-- `github.com/olekukonko/ll`: Logging.
-
-## Contributing
-Contributions welcome! Open issues/PRs on GitHub.
+Race detector is your friend. Jack is race-free by design.
 
 ## License
-MIT License. See [LICENSE](LICENSE).
+
+MIT
