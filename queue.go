@@ -246,6 +246,7 @@ func (q *Queue) dequeue() (queueItem, bool) {
 	return queueItem{}, false
 }
 
+// totalDepthLocked returns the total item count across all bins; caller holds mu.
 func (q *Queue) totalDepthLocked() int {
 	n := 0
 	for i := 0; i < priorityCount; i++ {
@@ -254,6 +255,7 @@ func (q *Queue) totalDepthLocked() int {
 	return n
 }
 
+// updateDepth stores the current depth and updates the high-water mark.
 func (q *Queue) updateDepth(depth int64) {
 	q.metrics.Depth.Store(depth)
 	for {
