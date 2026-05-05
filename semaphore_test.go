@@ -214,7 +214,6 @@ func TestSemaphoreConcurrentStress(t *testing.T) {
 }
 
 func TestSemaphoreCoDelOverload(t *testing.T) {
-	// Small capacity, many waiters to trigger CoDel
 	s := NewSemaphore(1,
 		SemaphoreWithTargetSojourn(10*time.Millisecond),
 		SemaphoreWithMaxSojourn(50*time.Millisecond),
@@ -241,12 +240,10 @@ func TestSemaphoreCoDelOverload(t *testing.T) {
 		}(i)
 	}
 
-	// Hold the slot long enough to trigger CoDel dropping
 	time.Sleep(100 * time.Millisecond)
 	s.Release()
 	wg.Wait()
 
-	// Some should have been dropped due to maxSojourn
 	timeouts := 0
 	for i := 0; i < 20; i++ {
 		if !acquired[i].Load() {
@@ -262,11 +259,82 @@ func TestSemaphoreInvalidPriority(t *testing.T) {
 	s := NewSemaphore(2)
 	defer s.Close()
 
-	// Should not panic on invalid priority
 	if !s.TryAcquire(Priority(-1)) {
 		t.Fatal("expected TryAcquire with invalid priority")
 	}
 	if !s.TryAcquire(Priority(100)) {
 		t.Fatal("expected TryAcquire with out-of-range priority")
+	}
+}
+
+func TestSemaphoreTryAcquireN(t *testing.T) {
+	s := NewSemaphore(5)
+	defer s.Close()
+
+	if !s.TryAcquireN(PriorityHigh, 3) {
+		t.Fatal("expected TryAcquireN(3) to succeed")
+	}
+	if s.Available() != 2 {
+		t.Fatalf("expected 2 available, got %d", s.Available())
+	}
+	if s.TryAcquireN(PriorityHigh, 3) {
+		t.Fatal("expected TryAcquireN(3) to fail with only 2 slots left")
+	}
+	if !s.TryAcquireN(PriorityHigh, 2) {
+		t.Fatal("expected TryAcquireN(2) to succeed")
+	}
+	if s.Available() != 0 {
+		t.Fatalf("expected 0 available, got %d", s.Available())
+	}
+}
+
+func TestSemaphoreAvailableAndCapacity(t *testing.T) {
+	s := NewSemaphore(4)
+	defer s.Close()
+
+	if s.Capacity() != 4 {
+		t.Fatalf("expected capacity 4, got %d", s.Capacity())
+	}
+	if s.Available() != 4 {
+		t.Fatalf("expected 4 available initially, got %d", s.Available())
+	}
+	s.TryAcquire(PriorityHigh)
+	if s.Available() != 3 {
+		t.Fatalf("expected 3 available after one acquire, got %d", s.Available())
+	}
+}
+
+func TestSemaphoreQueueDepthAccuracy(t *testing.T) {
+	s := NewSemaphore(1)
+	defer s.Close()
+
+	if !s.TryAcquire(PriorityHigh) {
+		t.Fatal("expected initial acquire")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			s.Acquire(ctx, PriorityHigh) //nolint:errcheck
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	depth := s.Metrics().QueueDepth.Load()
+	if depth < 1 {
+		t.Fatalf("expected queue depth >= 1 while waiters are blocked, got %d", depth)
+	}
+
+	s.Release()
+	wg.Wait()
+
+	time.Sleep(10 * time.Millisecond)
+	finalDepth := s.Metrics().QueueDepth.Load()
+	if finalDepth != 0 {
+		t.Fatalf("expected queue depth 0 after all waiters finished, got %d", finalDepth)
 	}
 }

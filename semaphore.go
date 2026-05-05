@@ -28,8 +28,8 @@ func SemaphoreWithTargetSojourn(d time.Duration) SemaphoreOption {
 	return func(s *Semaphore) { s.targetSojourn = d }
 }
 
-// SemaphoreWithMaxSojourn sets the hard ceiling on waiter age in CoDel dropping mode.
-// Waiters older than this are discarded only while the queue is actively shedding load.
+// SemaphoreWithMaxSojourn sets the hard ceiling on waiter age.
+// Exceeding this immediately engages dropping mode regardless of interval.
 func SemaphoreWithMaxSojourn(d time.Duration) SemaphoreOption {
 	return func(s *Semaphore) { s.maxSojourn = d }
 }
@@ -82,6 +82,20 @@ func (s *Semaphore) Metrics() *SemaphoreMetrics {
 	return s.metrics
 }
 
+// Available returns the number of slots currently available for acquisition.
+func (s *Semaphore) Available() int {
+	v := s.available.Load()
+	if v < 0 {
+		return 0
+	}
+	return int(v)
+}
+
+// Capacity returns the total slot capacity the semaphore was created with.
+func (s *Semaphore) Capacity() int {
+	return int(s.capacity)
+}
+
 // TryAcquire attempts to take a slot without blocking.
 // Returns false immediately if no slot is available or the semaphore is closed.
 func (s *Semaphore) TryAcquire(p Priority) bool {
@@ -94,6 +108,25 @@ func (s *Semaphore) TryAcquire(p Priority) bool {
 			return false
 		}
 		if s.available.CompareAndSwap(avail, avail-1) {
+			s.metrics.AcquiredFast.Add(1)
+			return true
+		}
+	}
+}
+
+// TryAcquireN attempts to take n slots atomically without blocking.
+// Returns false immediately if fewer than n slots are available or the semaphore is closed.
+func (s *Semaphore) TryAcquireN(p Priority, n int) bool {
+	if n <= 0 || s.closed.Load() {
+		return false
+	}
+	need := int64(n)
+	for {
+		avail := s.available.Load()
+		if avail < need {
+			return false
+		}
+		if s.available.CompareAndSwap(avail, avail-need) {
 			s.metrics.AcquiredFast.Add(1)
 			return true
 		}
@@ -125,21 +158,10 @@ func (s *Semaphore) Acquire(ctx context.Context, p Priority) error {
 	depth := s.queueDepthLocked()
 	s.queueMu.Unlock()
 
-	s.metrics.QueueDepth.Store(int64(depth))
-	for {
-		current := s.metrics.MaxQueueDepth.Load()
-		if int64(depth) <= current {
-			break
-		}
-		if s.metrics.MaxQueueDepth.CompareAndSwap(current, int64(depth)) {
-			break
-		}
-	}
+	s.updateQueueDepth(int64(depth))
 
 	select {
 	case <-w.ch:
-		// w.err is set by closeChWithErr when the waiter is rejected (Close or CoDel drop).
-		// A nil err means the slot was granted normally.
 		if w.err != nil {
 			return w.err
 		}
@@ -147,6 +169,7 @@ func (s *Semaphore) Acquire(ctx context.Context, p Priority) error {
 	case <-ctx.Done():
 		w.cancelled.Store(true)
 		s.metrics.Rejected.Add(1)
+		s.metrics.QueueDepth.Add(-1)
 		return ctx.Err()
 	}
 }
@@ -177,6 +200,7 @@ func (s *Semaphore) Release() {
 			if s.available.CompareAndSwap(avail, avail-1) {
 				w.closeCh()
 				s.metrics.AcquiredSlow.Add(1)
+				s.metrics.QueueDepth.Add(-1)
 				return
 			}
 		}
@@ -198,10 +222,10 @@ func (s *Semaphore) Close() {
 		}
 	}
 	s.queueMu.Unlock()
+	s.metrics.QueueDepth.Store(0)
 }
 
-// queueDepthLocked returns the total number of queued waiters across all priorities.
-// Caller must hold queueMu.
+// queueDepthLocked sums all per-priority queue lengths; caller holds queueMu.
 func (s *Semaphore) queueDepthLocked() int {
 	n := 0
 	for p := 0; p < priorityCount; p++ {
@@ -210,15 +234,28 @@ func (s *Semaphore) queueDepthLocked() int {
 	return n
 }
 
+// updateQueueDepth stores the depth and updates the high-water mark.
+func (s *Semaphore) updateQueueDepth(depth int64) {
+	s.metrics.QueueDepth.Store(depth)
+	for {
+		current := s.metrics.MaxQueueDepth.Load()
+		if depth <= current {
+			break
+		}
+		if s.metrics.MaxQueueDepth.CompareAndSwap(current, depth) {
+			break
+		}
+	}
+}
+
 // findWaiterLocked selects the next waiter using priority-first, CoDel-aware policy.
-// In dropping mode, it evicts stale waiters (age > maxSojourn) via closeChWithErr
-// so they wake immediately with an error rather than blocking until context expiry.
-// In normal mode, stale eviction is skipped — the waiter's own context handles timeout.
+// In dropping mode, waiters older than maxSojourn are evicted via closeChWithErr so
+// they wake immediately. In normal mode, age eviction is skipped — the waiter's own
+// context handles timeout, preserving priority ordering correctness.
 // Caller must hold queueMu.
 func (s *Semaphore) findWaiterLocked() *waiter {
 	now := time.Now().UnixNano()
 
-	// CoDel overload detection: measure oldest waiter age across all priorities.
 	oldest := int64(0)
 	for p := 0; p < priorityCount; p++ {
 		if w := s.queues[p].peek(); w != nil {
@@ -231,7 +268,6 @@ func (s *Semaphore) findWaiterLocked() *waiter {
 	if oldest > 0 {
 		sojourn := time.Duration(now - oldest)
 		if sojourn > s.maxSojourn {
-			// Hard ceiling exceeded: engage dropping immediately regardless of interval.
 			s.dropping.Store(true)
 		} else if sojourn > s.targetSojourn {
 			fa := s.firstAbove.Load()
@@ -251,8 +287,6 @@ func (s *Semaphore) findWaiterLocked() *waiter {
 
 	dropping := s.dropping.Load()
 
-	// Serve highest priority first. Within a priority level, use LIFO under overload
-	// (shed the newest waiters) and FIFO under normal load (fairness).
 	for p := 0; p < priorityCount; p++ {
 		q := &s.queues[p]
 		if q.len() == 0 {
@@ -266,15 +300,14 @@ func (s *Semaphore) findWaiterLocked() *waiter {
 					break
 				}
 				if w.cancelled.Load() {
+					s.metrics.QueueDepth.Add(-1)
 					continue
 				}
-				// In dropping mode, actively evict waiters that have aged past maxSojourn.
-				// closeChWithErr wakes the goroutine immediately instead of leaving it
-				// blocked until its context deadline fires.
 				if time.Duration(now-w.enqueueAt) > s.maxSojourn {
 					w.cancelled.Store(true)
 					w.closeChWithErr(context.DeadlineExceeded)
 					s.metrics.Timeouts.Add(1)
+					s.metrics.QueueDepth.Add(-1)
 					continue
 				}
 				return w
@@ -286,14 +319,37 @@ func (s *Semaphore) findWaiterLocked() *waiter {
 					break
 				}
 				if w.cancelled.Load() {
+					s.metrics.QueueDepth.Add(-1)
 					continue
 				}
-				// In normal mode do not evict by age — the waiter's own context handles
-				// timeout. Evicting here would break priority ordering tests that use a
-				// short sleep before Release.
 				return w
 			}
 		}
 	}
 	return nil
+}
+
+// resize adjusts the available slot count by delta (positive = add, negative = remove).
+// Removal only takes free slots; in-flight holders are never disturbed.
+// Called by AdaptiveLimiter to apply a new concurrency limit.
+func (s *Semaphore) resize(delta int) {
+	if delta == 0 {
+		return
+	}
+	if delta > 0 {
+		s.available.Add(int64(delta))
+		return
+	}
+	// Remove free slots only — never starve in-flight callers.
+	for i := 0; i < -delta; i++ {
+		for {
+			avail := s.available.Load()
+			if avail <= 0 {
+				return
+			}
+			if s.available.CompareAndSwap(avail, avail-1) {
+				break
+			}
+		}
+	}
 }
