@@ -18,10 +18,15 @@ const (
 
 const priorityCount = 4
 
+// waiterQueueCompactThreshold is the number of pops after which the backing
+// slice is compacted to reclaim memory consumed by FIFO head-slicing.
+const waiterQueueCompactThreshold = 64
+
 var (
 	ErrSemaphoreClosed   = errors.New("semaphore closed")
 	ErrRateLimiterClosed = errors.New("rate limiter closed")
 	ErrThrottleClosed    = errors.New("adaptive throttle closed")
+	ErrQueueClosed       = errors.New("priority queue closed")
 )
 
 // backpressureMetrics is embedded by all backpressure types.
@@ -58,40 +63,58 @@ func (w *waiter) closeChWithErr(err error) {
 
 // waiterQueue holds blocked goroutines for a single priority level.
 // It supports both FIFO (fairness) and LIFO (overload) extraction.
+// The head index avoids repeated slice copies on FIFO pops; the slice
+// is compacted every waiterQueueCompactThreshold pops to bound memory.
 type waiterQueue struct {
-	waiters []*waiter
+	waiters  []*waiter
+	head     int
+	popCount int
 }
 
+// push appends a waiter to the end of the queue.
 func (q *waiterQueue) push(w *waiter) {
 	q.waiters = append(q.waiters, w)
 }
 
+// popFIFO removes and returns the oldest waiter; compacts the slice periodically.
 func (q *waiterQueue) popFIFO() *waiter {
-	if len(q.waiters) == 0 {
+	if q.head >= len(q.waiters) {
 		return nil
 	}
-	w := q.waiters[0]
-	q.waiters = q.waiters[1:]
+	w := q.waiters[q.head]
+	q.waiters[q.head] = nil // release reference
+	q.head++
+	q.popCount++
+	if q.popCount >= waiterQueueCompactThreshold {
+		q.waiters = append(q.waiters[:0], q.waiters[q.head:]...)
+		q.head = 0
+		q.popCount = 0
+	}
 	return w
 }
 
+// popLIFO removes and returns the newest waiter (used under CoDel dropping mode).
 func (q *waiterQueue) popLIFO() *waiter {
 	n := len(q.waiters)
-	if n == 0 {
+	if q.head >= n {
 		return nil
 	}
-	w := q.waiters[n-1]
-	q.waiters = q.waiters[:n-1]
+	last := n - 1
+	w := q.waiters[last]
+	q.waiters[last] = nil
+	q.waiters = q.waiters[:last]
 	return w
 }
 
+// peek returns the oldest waiter without removing it.
 func (q *waiterQueue) peek() *waiter {
-	if len(q.waiters) == 0 {
+	if q.head >= len(q.waiters) {
 		return nil
 	}
-	return q.waiters[0]
+	return q.waiters[q.head]
 }
 
+// len returns the number of waiters currently in the queue.
 func (q *waiterQueue) len() int {
-	return len(q.waiters)
+	return len(q.waiters) - q.head
 }

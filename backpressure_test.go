@@ -87,6 +87,22 @@ func TestWaiterQueuePeek(t *testing.T) {
 	}
 }
 
+func TestWaiterQueueCompaction(t *testing.T) {
+	q := &waiterQueue{}
+	for i := 0; i < waiterQueueCompactThreshold+10; i++ {
+		q.push(&waiter{ch: make(chan struct{}, 1)})
+	}
+	for i := 0; i < waiterQueueCompactThreshold; i++ {
+		q.popFIFO()
+	}
+	if q.head != 0 {
+		t.Fatalf("expected head reset to 0 after compaction, got %d", q.head)
+	}
+	if q.len() != 10 {
+		t.Fatalf("expected 10 remaining after compaction, got %d", q.len())
+	}
+}
+
 func TestWaiterCancellation(t *testing.T) {
 	w := &waiter{ch: make(chan struct{}, 1), enqueueAt: time.Now().UnixNano()}
 	if w.cancelled.Load() {
@@ -107,6 +123,12 @@ func TestBackpressureErrors(t *testing.T) {
 	}
 	if ErrThrottleClosed == nil {
 		t.Fatal("ErrThrottleClosed must not be nil")
+	}
+	if ErrQueueClosed == nil {
+		t.Fatal("ErrQueueClosed must not be nil")
+	}
+	if ErrQueueFull == nil {
+		t.Fatal("ErrQueueFull must not be nil")
 	}
 }
 
