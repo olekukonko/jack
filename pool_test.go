@@ -670,3 +670,69 @@ func TestPool_ConcurrentSubmissions(t *testing.T) {
 	}
 	t.Logf("Concurrent test: Queued: %d, Run: %d, Done: %d (submitted %d tasks, %d submit errors)", len(finalQueuedEvents), len(finalRunEvents), len(finalDoneEvents), numTasks, atomic.LoadInt32(&submitErrors))
 }
+
+func TestPoolMetrics(t *testing.T) {
+	p := NewPool(2, PoolingWithQueueSize(10))
+	defer p.Shutdown(5 * time.Second)
+
+	var done sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		done.Add(1)
+		p.Submit(Func(func() error {
+			defer done.Done()
+			return nil
+		}))
+	}
+	done.Wait()
+	time.Sleep(20 * time.Millisecond)
+
+	m := p.Metrics()
+	if m.TasksSubmitted.Load() != 5 {
+		t.Fatalf("expected 5 submitted, got %d", m.TasksSubmitted.Load())
+	}
+	if m.TasksCompleted.Load() != 5 {
+		t.Fatalf("expected 5 completed, got %d", m.TasksCompleted.Load())
+	}
+	if m.TasksFailed.Load() != 0 {
+		t.Fatalf("expected 0 failed, got %d", m.TasksFailed.Load())
+	}
+}
+
+func TestPoolMetricsFailure(t *testing.T) {
+	p := NewPool(1)
+	defer p.Shutdown(5 * time.Second)
+
+	var done sync.WaitGroup
+	done.Add(1)
+	p.Submit(Func(func() error {
+		defer done.Done()
+		return errors.New("task error")
+	}))
+	done.Wait()
+	time.Sleep(20 * time.Millisecond)
+
+	m := p.Metrics()
+	if m.TasksFailed.Load() != 1 {
+		t.Fatalf("expected 1 failed, got %d", m.TasksFailed.Load())
+	}
+}
+
+func TestPoolMetricsRejected(t *testing.T) {
+	p := NewPool(1, PoolingWithQueueSize(0))
+	defer p.Shutdown(time.Second)
+
+	// Worker is busy, queue is zero-sized — submissions should be rejected.
+	hold := make(chan struct{})
+	p.Submit(Func(func() error { <-hold; return nil }))
+	time.Sleep(10 * time.Millisecond)
+
+	for i := 0; i < 3; i++ {
+		p.Submit(Func(func() error { return nil }))
+	}
+	close(hold)
+
+	m := p.Metrics()
+	if m.TasksRejected.Load() == 0 {
+		t.Fatal("expected some rejected tasks when queue is full")
+	}
+}

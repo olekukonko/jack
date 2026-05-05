@@ -11,9 +11,22 @@ import (
 	"github.com/olekukonko/ll"
 )
 
+// PoolMetrics tracks operational statistics for a Pool.
+// All fields use atomic operations and are safe for concurrent reads without locking.
+type PoolMetrics struct {
+	TasksSubmitted  atomic.Uint64 // total tasks accepted into the queue
+	TasksCompleted  atomic.Uint64 // tasks that finished without error
+	TasksFailed     atomic.Uint64 // tasks that returned an error or panicked
+	TasksRejected   atomic.Uint64 // tasks dropped due to full queue or closed pool
+	PanicsRecovered atomic.Uint64 // panics caught inside task execution
+	QueueDepth      atomic.Int64  // current number of tasks waiting in the channel
+	MaxQueueDepth   atomic.Int64  // high-water mark of QueueDepth
+	TotalDurationNs atomic.Int64  // cumulative nanoseconds spent executing tasks
+	ActiveWorkers   atomic.Int64  // workers currently executing a task
+}
+
 // Pool manages a fixed number of worker goroutines to execute tasks concurrently.
 // It supports task submission with or without context, shutdown with timeout, and observability.
-// The pool uses a channel for task queuing and a wait group for graceful shutdown.
 type Pool struct {
 	tasks      chan job
 	quitOnce   sync.Once
@@ -21,44 +34,36 @@ type Pool struct {
 	observable Observable[Event]
 	numWorkers int
 	opts       poolingOpt
+	metrics    *PoolMetrics
 
-	// Lock-free state
 	closed atomic.Bool
 
-	// sendMu protects the channel close operation only
-	// Writers hold RLock; Shutdown acquires Lock before close(tasks)
+	// sendMu protects the channel close operation only.
+	// Writers hold RLock; Shutdown acquires Lock before close(tasks).
 	sendMu sync.RWMutex
 
 	logger *ll.Logger
 }
 
-// poolingOpt holds configuration options for the pool, such as queue size, observable, and ID generator.
-// These options are applied during pool creation to customize behavior.
-// Defaults include queue size based on workers and a default task ID generator.
+// poolingOpt holds configuration options for the pool.
 type poolingOpt struct {
-	queueSize            int
-	observable           Observable[Event]
-	taskIDGenerator      func(interface{}) string
-	defaultWorkerContext context.Context
+	queueSize       int
+	observable      Observable[Event]
+	taskIDGenerator func(interface{}) string
+	noID            bool // skip ID generation entirely — zero allocation submit path
 }
 
 // Pooling is a functional option type for configuring the pool during creation.
-// It allows setting observable, queue size, ID generator, etc., in a flexible manner.
-// Multiple options can be passed to NewPool for combined configuration.
 type Pooling func(*poolingOpt)
 
-// PoolingWithObservable sets an observable for event notifications in the pool options.
-// The observable will receive events like queued, run, done for tasks.
-// Useful for monitoring and logging pool activities externally.
+// PoolingWithObservable sets an observable for event notifications in the pool.
+// The observable receives "queued", "run", and "done" events for every task.
 func PoolingWithObservable(obs Observable[Event]) Pooling {
-	return func(opts *poolingOpt) {
-		opts.observable = obs
-	}
+	return func(opts *poolingOpt) { opts.observable = obs }
 }
 
-// PoolingWithQueueSize sets the task queue size in the pool options.
-// If size is negative, it is ignored and defaults to twice the number of workers.
-// A larger queue allows more pending tasks but may increase memory usage.
+// PoolingWithQueueSize sets the task queue buffer size.
+// Defaults to 2× the worker count when not provided or negative.
 func PoolingWithQueueSize(size int) Pooling {
 	return func(opts *poolingOpt) {
 		if size >= 0 {
@@ -67,18 +72,21 @@ func PoolingWithQueueSize(size int) Pooling {
 	}
 }
 
-// PoolingWithIDGenerator sets a custom task ID generator function in the pool options.
-// The function takes the task interface and returns a unique string ID.
-// Defaults to a built-in generator if not provided.
+// PoolingWithIDGenerator sets a custom task ID generator function.
 func PoolingWithIDGenerator(fn func(interface{}) string) Pooling {
-	return func(opts *poolingOpt) {
-		opts.taskIDGenerator = fn
-	}
+	return func(opts *poolingOpt) { opts.taskIDGenerator = fn }
+}
+
+// PoolingWithNoID disables task ID generation entirely.
+// This eliminates all allocations in the Submit hot path when observability
+// (logging, event emission) is not needed. The worker will log an empty task ID.
+// Use when pool submission is on a latency-critical path and task tracing is not required.
+func PoolingWithNoID() Pooling {
+	return func(opts *poolingOpt) { opts.noID = true }
 }
 
 // NewPool creates a new pool with the specified number of workers and optional configurations.
-// Ensures at least one worker; initializes task channel, observable, and logger.
-// Starts all workers immediately and returns the ready pool instance.
+// Workers start immediately. At least one worker is always created.
 func NewPool(numWorkers int, opts ...Pooling) *Pool {
 	if numWorkers <= 0 {
 		numWorkers = 1
@@ -95,6 +103,7 @@ func NewPool(numWorkers int, opts ...Pooling) *Pool {
 		tasks:      make(chan job, options.queueSize),
 		observable: options.observable,
 		opts:       options,
+		metrics:    &PoolMetrics{},
 	}
 	if logger != nil {
 		p.logger = logger.Namespace("pool")
@@ -103,15 +112,18 @@ func NewPool(numWorkers int, opts ...Pooling) *Pool {
 	}
 	p.shutdownWg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
-		w := newWorker(i+1, p.tasks, &p.shutdownWg, p.observable)
+		w := newWorker(i+1, p.tasks, &p.shutdownWg, p.observable, p.metrics)
 		w.start()
 	}
 	return p
 }
 
+// Metrics returns the pool's operational metrics.
+func (p *Pool) Metrics() *PoolMetrics {
+	return p.metrics
+}
+
 // Logger sets a custom logger for the pool, namespacing it as "pool".
-// If the provided logger is nil, it retains the existing logger.
-// Returns the pool for method chaining.
 func (p *Pool) Logger(extLogger *ll.Logger) *Pool {
 	if extLogger != nil {
 		p.logger = extLogger.Namespace("pool")
@@ -119,158 +131,157 @@ func (p *Pool) Logger(extLogger *ll.Logger) *Pool {
 	return p
 }
 
-// Do is a shorthand for pool.Submit(Func(...)) but discards any returned error
+// Do submits a void function as a task, discarding any submission error.
 func (p *Pool) Do(fn func()) {
 	_ = p.Submit(Func(func() error { fn(); return nil }))
 }
 
-// DoCtx is a shorthand for pool.SubmitCtx(FuncCtx(...)) but discards any returned error
+// DoCtx submits a context-aware void function as a task, discarding any submission error.
 func (p *Pool) DoCtx(ctx context.Context, fn func(ctx context.Context)) {
 	_ = p.SubmitCtx(ctx, FuncCtx(func(ctx context.Context) error { fn(ctx); return nil }))
 }
 
 // tryEnqueue attempts to send a job to the pool's task channel.
-// It returns (sent, poolClosed) where sent indicates successful enqueue,
-// and poolClosed indicates the pool was closed during the attempt.
-func (p *Pool) tryEnqueue(job job, ctx context.Context, nonBlocking bool) (sent, poolClosed bool) {
-	// Fast path: lock-free closed check (hot path)
+// Returns (sent, poolClosed).
+func (p *Pool) tryEnqueue(j job, ctx context.Context, nonBlocking bool) (sent, poolClosed bool) {
 	if p.closed.Load() {
 		return false, true
 	}
-
 	if nonBlocking {
-		// Non-blocking: try send with default case
 		select {
-		case p.tasks <- job:
+		case p.tasks <- j:
 			return true, false
 		default:
-			// Queue full - recheck closed and return
 			if p.closed.Load() {
 				return false, true
 			}
 			return false, false
 		}
 	}
-
-	// Blocking path: need to hold sendMu.RLock to prevent close during send
-	// This is the slow path, but still check closed first to avoid lock in shutdown case
 	if p.closed.Load() {
 		return false, true
 	}
-
 	p.sendMu.RLock()
 	defer p.sendMu.RUnlock()
-
-	// Double-check after acquiring lock
 	if p.closed.Load() {
 		return false, true
 	}
-
 	select {
-	case p.tasks <- job:
+	case p.tasks <- j:
 		return true, false
 	case <-ctx.Done():
 		return false, false
 	}
 }
 
-// Submit enqueues one or more tasks to the pool for execution without context.
-// Checks if pool is closed; returns error for nil tasks or full queue.
-// Notifies observable of queued events and logs submission details.
+// recordEnqueue stores the current queue depth and updates the high-water mark.
+func (p *Pool) recordEnqueue(depth int) {
+	d := int64(depth)
+	p.metrics.QueueDepth.Store(d)
+	for {
+		cur := p.metrics.MaxQueueDepth.Load()
+		if d <= cur {
+			break
+		}
+		if p.metrics.MaxQueueDepth.CompareAndSwap(cur, d) {
+			break
+		}
+	}
+}
+
+// Submit enqueues one or more tasks for execution without context.
+// Returns ErrPoolClosed if the pool is shut down, ErrQueueFull if the queue is at capacity.
 func (p *Pool) Submit(ts ...Task) error {
 	for i, t := range ts {
 		if t == nil {
 			p.logger.Info("Pool.Submit received nil task at index %d", i)
 			return fmt.Errorf("nil task at index %d in batch", i)
 		}
-		job := &tasker{
+		j := &tasker{
 			task:            t,
 			ctx:             context.Background(),
 			taskIDGenerator: p.opts.taskIDGenerator,
 			defaultIDPrefix: "task",
+			noID:            p.opts.noID,
 		}
-		taskID := job.ID()
+		taskID := j.ID()
 		if p.observable != nil {
 			p.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 		}
-
-		// Lock-free fast path
-		sent, poolClosed := p.tryEnqueue(job, context.Background(), true)
+		sent, poolClosed := p.tryEnqueue(j, context.Background(), true)
 		if poolClosed {
+			p.metrics.TasksRejected.Add(1)
 			return ErrPoolClosed
 		}
 		if !sent {
-			p.logger.Warn("Pool.Submit: failed to enqueue task %s (index %d): queue full", taskID, i)
+			p.metrics.TasksRejected.Add(1)
+			p.logger.Warn("Pool.Submit: queue full for task %s (index %d)", taskID, i)
 			return ErrQueueFull
 		}
+		p.metrics.TasksSubmitted.Add(1)
+		p.recordEnqueue(len(p.tasks))
 		p.logger.Debug("Pool.Submit: enqueued task %s", taskID)
 	}
 	return nil
 }
 
-// SubmitCtx enqueues one or more context-aware tasks to the pool.
-// First checks parent context; then pool closure; handles nil tasks and context cancellation during submission.
-// Notifies observable and logs; returns errors for closure, nil tasks, or queue issues.
+// SubmitCtx enqueues one or more context-aware tasks for execution.
+// Blocks until the task is queued, the context is cancelled, or the pool is closed.
 func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
-
 	for i, t := range ts {
 		if t == nil {
 			p.logger.Info("Pool.SubmitCtx received nil TaskCtx at index %d", i)
 			return fmt.Errorf("nil TaskCtx at index %d in batch", i)
 		}
-		job := &tasker{
+		j := &tasker{
 			task:            t,
 			ctx:             ctx,
 			taskIDGenerator: p.opts.taskIDGenerator,
 			defaultIDPrefix: "task",
+			noID:            p.opts.noID,
 		}
-		taskID := job.ID()
+		taskID := j.ID()
 		if p.observable != nil {
 			p.observable.Notify(Event{Type: "queued", TaskID: taskID, Time: time.Now()})
 		}
-
-		// Lock-free attempt first
-		sent, poolClosed := p.tryEnqueue(job, ctx, false)
+		sent, poolClosed := p.tryEnqueue(j, ctx, false)
 		if poolClosed {
+			p.metrics.TasksRejected.Add(1)
 			return ErrPoolClosed
 		}
 		if !sent {
-			p.logger.Info("Pool.SubmitCtx: context done while submitting task %s (index %d): %v", taskID, i, ctx.Err())
+			p.metrics.TasksRejected.Add(1)
+			p.logger.Info("Pool.SubmitCtx: context done for task %s (index %d): %v", taskID, i, ctx.Err())
 			return ctx.Err()
 		}
+		p.metrics.TasksSubmitted.Add(1)
+		p.recordEnqueue(len(p.tasks))
 		p.logger.Debug("Pool.SubmitCtx: enqueued task %s", taskID)
 	}
 	return nil
 }
 
-// Shutdown gracefully stops the pool, closing the task channel and waiting for workers with a timeout.
-// Idempotent; logs shutdown process and returns timeout error if workers don't finish in time.
-// Ensures no new tasks are accepted after initiation.
+// Shutdown gracefully stops the pool and waits for all workers to finish.
+// Returns ErrShutdownTimedOut if workers do not exit within the timeout.
 func (p *Pool) Shutdown(timeout time.Duration) error {
-	// Fast path: already closed
 	if !p.closed.CompareAndSwap(false, true) {
 		return ErrPoolClosed
 	}
-
-	// Acquire write lock to wait for all in-flight blocking senders
 	p.sendMu.Lock()
 	close(p.tasks)
 	p.sendMu.Unlock()
 
 	p.logger.Info("Pool shutdown started, workers: %d, goroutines: %d", p.numWorkers, runtime.NumGoroutine())
-
 	p.quitOnce.Do(func() {})
 
 	done := make(chan struct{})
 	go func() {
-		p.logger.Info("Waiting for %d workers to shut down...", p.numWorkers)
 		p.shutdownWg.Wait()
-		p.logger.Info("All %d workers shut down, goroutines: %d", p.numWorkers, runtime.NumGoroutine())
 		close(done)
 	}()
 
@@ -279,26 +290,16 @@ func (p *Pool) Shutdown(timeout time.Duration) error {
 		p.logger.Info("Pool shutdown completed successfully.")
 		return nil
 	case <-time.After(timeout):
-		p.logger.Warn("Pool shutdown timed out after %v, goroutines: %d", timeout, runtime.NumGoroutine())
+		p.logger.Warn("Pool shutdown timed out after %v", timeout)
 		return ErrShutdownTimedOut
 	}
 }
 
-// QueueSize returns the current number of pending tasks in the queue.
-// Useful for monitoring pool load and backpressure.
-// Thread-safe due to channel len being atomic.
-func (p *Pool) QueueSize() int {
-	return len(p.tasks)
-}
+// QueueSize returns the current number of pending tasks in the buffer.
+func (p *Pool) QueueSize() int { return len(p.tasks) }
 
-// Workers returns the number of worker goroutines configured in the pool.
-// This is fixed at creation and does not change dynamically.
-// Helpful for querying pool capacity.
-func (p *Pool) Workers() int {
-	return p.numWorkers
-}
+// Workers returns the number of worker goroutines in the pool.
+func (p *Pool) Workers() int { return p.numWorkers }
 
-// IsClosed returns true if the pool has been closed
-func (p *Pool) IsClosed() bool {
-	return p.closed.Load()
-}
+// IsClosed returns true if the pool has been shut down.
+func (p *Pool) IsClosed() bool { return p.closed.Load() }
