@@ -141,6 +141,7 @@ func (p *Patient) Remove() {
 	}
 }
 
+// handleFailure increments failure counters and transitions state toward Degraded or Failed.
 func (p *Patient) handleFailure(err error, cfg PatientConfig) {
 	p.lastError.Store(storedError{err: err})
 	p.successes.Store(0)
@@ -171,6 +172,7 @@ func (p *Patient) handleFailure(err error, cfg PatientConfig) {
 	}
 }
 
+// handleSuccess resets failure counters and transitions state toward Healthy.
 func (p *Patient) handleSuccess(cfg PatientConfig) {
 	p.failures.Store(0)
 
@@ -220,6 +222,7 @@ func (p *Patient) handleSuccess(cfg PatientConfig) {
 	}
 }
 
+// setDegraded manually forces the patient into Degraded or Healthy state.
 func (p *Patient) setDegraded(degraded bool, d *Doctor) {
 	oldState := p.state.Load().(PatientState)
 	if degraded {
@@ -258,6 +261,7 @@ func (p *Patient) setDegraded(degraded bool, d *Doctor) {
 	}
 }
 
+// emitStateChange fires the OnStateChange callback with a PatientEvent.
 func (p *Patient) emitStateChange(old, new PatientState, err error) {
 	if p.cfg.OnStateChange != nil {
 		p.cfg.OnStateChange(PatientEvent{
@@ -269,6 +273,7 @@ func (p *Patient) emitStateChange(old, new PatientState, err error) {
 	}
 }
 
+// effectiveInterval returns the check interval, using Accelerated when degraded.
 func (p *Patient) effectiveInterval() time.Duration {
 	base := p.cfg.Interval
 	if p.state.Load().(PatientState) == PatientDegraded && p.cfg.Accelerated > 0 {
@@ -278,6 +283,7 @@ func (p *Patient) effectiveInterval() time.Duration {
 	return p.jitteredInterval(base)
 }
 
+// jitteredInterval adds proportional random jitter to base to spread check load.
 func (p *Patient) jitteredInterval(base time.Duration) time.Duration {
 	if p.cfg.Jitter <= 0 {
 		return base

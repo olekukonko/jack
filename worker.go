@@ -7,18 +7,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oklog/ulid/v2"
 	"github.com/olekukonko/ll"
 )
 
 // worker processes jobs from a task channel in a worker pool.
-// It logs events and notifies an observable of job execution status.
-// Thread-safe via channel operations and wait group synchronization.
 type worker struct {
 	id         int
 	taskChan   <-chan job
 	wg         *sync.WaitGroup
 	observable Observable[Event]
+	metrics    *PoolMetrics
 	logger     *ll.Logger
 }
 
@@ -27,7 +25,7 @@ type worker struct {
 // Example:
 //
 // w := newWorker(1, taskChan, wg, obs) // Creates worker with ID 1
-func newWorker(id int, taskChan <-chan job, wg *sync.WaitGroup, obs Observable[Event]) *worker {
+func newWorker(id int, taskChan <-chan job, wg *sync.WaitGroup, obs Observable[Event], metrics *PoolMetrics) *worker {
 	var workerLogger *ll.Logger
 	if logger != nil {
 		workerLogger = logger.Namespace(fmt.Sprintf("worker-%d", id))
@@ -39,6 +37,7 @@ func newWorker(id int, taskChan <-chan job, wg *sync.WaitGroup, obs Observable[E
 		taskChan:   taskChan,
 		wg:         wg,
 		observable: obs,
+		metrics:    metrics,
 		logger:     workerLogger,
 	}
 }
@@ -55,75 +54,87 @@ func (w *worker) start() {
 		defer func() {
 			w.wg.Done()
 			if w.logger != nil {
-				w.logger.Info("Worker %d wait group done, goroutines: %d", w.id, runtime.NumGoroutine())
+				w.logger.Info("Worker %d exiting, goroutines: %d", w.id, runtime.NumGoroutine())
 			}
 		}()
 		workerIDStr := fmt.Sprintf("worker-%d", w.id)
-		if w.logger != nil {
-			w.logger.Info("Worker %d starting, goroutines: %d", w.id, runtime.NumGoroutine())
-		}
 		for {
-			select {
-			case job, ok := <-w.taskChan:
-				if !ok {
-					if w.logger != nil {
-						w.logger.Info("Worker %d task channel closed, exiting", w.id)
-					}
-					return
-				}
-				if job == nil {
-					if w.logger != nil {
-						w.logger.Info("Worker %d received nil job, skipping", w.id)
-					}
-					continue
-				}
-				taskID := job.ID()
-				if taskID == "" {
-					taskID = "unknown-task-" + ulid.Make().String()
-					if w.logger != nil {
-						w.logger.Info("Worker %d assigned ID %s to job with empty taskID", w.id, taskID)
-					}
-				}
-				originalCtx := job.Context()
-				if w.observable != nil {
-					w.observable.Notify(Event{Type: "run", WorkerID: workerIDStr, TaskID: taskID, Time: time.Now()})
-				}
-				startTime := time.Now()
-				errCh := make(chan error, 1)
-				executeDone := make(chan struct{})
-				go func() {
-					defer func() {
-						if r := recover(); r != nil {
-							errCh <- &CaughtPanic{Value: r, Stack: debug.Stack()}
-							if w.logger != nil {
-								w.logger.Info("PANIC in task execution (Worker %d, TaskID %s): %v", w.id, taskID, r)
-							}
+			job, ok := <-w.taskChan
+			if !ok {
+				return
+			}
+			if job == nil {
+				continue
+			}
+
+			taskID := job.ID()
+			if taskID == "" {
+				taskID = "unknown-task." + newULID()
+			}
+
+			originalCtx := job.Context()
+			if w.observable != nil {
+				w.observable.Notify(Event{Type: "run", WorkerID: workerIDStr, TaskID: taskID, Time: time.Now()})
+			}
+
+			// Track queue depth: one item leaving the channel.
+			if w.metrics != nil {
+				w.metrics.ActiveWorkers.Add(1)
+				w.metrics.QueueDepth.Add(-1)
+			}
+
+			startTime := time.Now()
+			errCh := make(chan error, 1)
+			executeDone := make(chan struct{})
+
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						errCh <- &CaughtPanic{Value: r, Stack: debug.Stack()}
+						if w.metrics != nil {
+							w.metrics.PanicsRecovered.Add(1)
 						}
-						close(executeDone)
-					}()
-					errCh <- job.Run(originalCtx)
-				}()
-				var err error
-				select {
-				case <-executeDone:
-					err = <-errCh
-				case <-originalCtx.Done():
-					<-executeDone
-					err = <-errCh
-					if err == nil {
-						err = originalCtx.Err()
+						if w.logger != nil {
+							w.logger.Info("PANIC in task execution (Worker %d, TaskID %s): %v", w.id, taskID, r)
+						}
 					}
+					close(executeDone)
+				}()
+				errCh <- job.Run(originalCtx)
+			}()
+
+			var err error
+			select {
+			case <-executeDone:
+				err = <-errCh
+			case <-originalCtx.Done():
+				<-executeDone
+				err = <-errCh
+				if err == nil {
+					err = originalCtx.Err()
 				}
-				if w.observable != nil {
-					w.observable.Notify(Event{
-						Type:     "done",
-						WorkerID: workerIDStr,
-						TaskID:   taskID,
-						Time:     time.Now(),
-						Duration: time.Since(startTime),
-						Err:      err,
-					})
+			}
+
+			duration := time.Since(startTime)
+			if w.metrics != nil {
+				w.metrics.ActiveWorkers.Add(-1)
+				w.metrics.TotalDurationNs.Add(int64(duration))
+				if err != nil {
+					w.metrics.TasksFailed.Add(1)
+				} else {
+					w.metrics.TasksCompleted.Add(1)
 				}
+			}
+
+			if w.observable != nil {
+				w.observable.Notify(Event{
+					Type:     "done",
+					WorkerID: workerIDStr,
+					TaskID:   taskID,
+					Time:     time.Now(),
+					Duration: duration,
+					Err:      err,
+				})
 			}
 		}
 	}()

@@ -31,16 +31,19 @@ type ReaperMetrics struct {
 	StopsReceived   atomic.Uint64
 }
 
+// recordTouch increments the touch call counter and total tasks seen.
 func (m *ReaperMetrics) recordTouch() {
 	m.TouchCalls.Add(1)
 	m.TotalTasksSeen.Add(1)
 }
 
+// recordTouchAt increments the touchAt call counter and total tasks seen.
 func (m *ReaperMetrics) recordTouchAt() {
 	m.TouchAtCalls.Add(1)
 	m.TotalTasksSeen.Add(1)
 }
 
+// recordActiveCount stores the current active task count and updates the high-water mark.
 func (m *ReaperMetrics) recordActiveCount(count int) {
 	m.ActiveTasks.Store(int64(count))
 	for {
@@ -55,6 +58,7 @@ func (m *ReaperMetrics) recordActiveCount(count int) {
 	}
 }
 
+// recordExpiration updates expiry counters and timing histograms.
 func (m *ReaperMetrics) recordExpiration(elapsed time.Duration, handled bool, err error) {
 	m.ExpiredTotal.Add(1)
 	elapsedMs := int64(elapsed.Milliseconds())
@@ -119,11 +123,13 @@ type reaperHeap []*ReaperTask
 
 func (h reaperHeap) Len() int { return len(h) }
 func (h reaperHeap) Less(i, j int) bool {
+	// Zero deadline means "no expiry" — sort these last so they are never
+	// processed before tasks that have a real deadline.
 	if h[i].Deadline.IsZero() {
-		return true
+		return false
 	}
 	if h[j].Deadline.IsZero() {
-		return false
+		return true
 	}
 	return h[i].Deadline.Before(h[j].Deadline)
 }
@@ -168,6 +174,7 @@ type Reaper struct {
 
 type ReaperOption func(*Reaper)
 
+// ReaperWithLogger sets a custom logger for the reaper.
 func ReaperWithLogger(l *ll.Logger) ReaperOption {
 	return func(r *Reaper) {
 		if l != nil {
@@ -176,12 +183,14 @@ func ReaperWithLogger(l *ll.Logger) ReaperOption {
 	}
 }
 
+// ReaperWithHandler sets the callback invoked when an entry's TTL expires.
 func ReaperWithHandler(h ReaperHandler) ReaperOption {
 	return func(r *Reaper) {
 		r.handler = h
 	}
 }
 
+// ReaperWithShards controls the number of internal heap shards for reduced contention.
 func ReaperWithShards(count uint32) ReaperOption {
 	return func(r *Reaper) {
 		if count >= 1 && (count&(count-1)) == 0 {
@@ -190,6 +199,7 @@ func ReaperWithShards(count uint32) ReaperOption {
 	}
 }
 
+// ReaperWithMinTick sets the minimum poll interval for the expiry loop.
 func ReaperWithMinTick(tick time.Duration) ReaperOption {
 	return func(r *Reaper) {
 		if tick > 0 {
@@ -198,6 +208,7 @@ func ReaperWithMinTick(tick time.Duration) ReaperOption {
 	}
 }
 
+// ReaperWithTimerLimit caps the duration the reaper will sleep before checking again.
 func ReaperWithTimerLimit(limit time.Duration) ReaperOption {
 	return func(r *Reaper) {
 		if limit > 0 {
@@ -206,6 +217,8 @@ func ReaperWithTimerLimit(limit time.Duration) ReaperOption {
 	}
 }
 
+// NewReaper creates a TTL-based expiry manager with min-heap scheduling.
+// The handler is called once per expired entry in a background goroutine.
 func NewReaper(ttl time.Duration, opts ...ReaperOption) *Reaper {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Reaper{
@@ -235,6 +248,7 @@ func NewReaper(ttl time.Duration, opts ...ReaperOption) *Reaper {
 	return r
 }
 
+// Metrics returns the reaper's operational statistics.
 func (r *Reaper) Metrics() *ReaperMetrics {
 	return r.metrics
 }
@@ -249,12 +263,14 @@ func (r *Reaper) Register(h ReaperHandler) {
 	r.handler = h
 }
 
+// getShard maps an ID to a shard index using FNV hashing.
 func (r *Reaper) getShard(id string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(id))
 	return h.Sum32() & (r.shardCount - 1)
 }
 
+// loop is the per-shard background goroutine that drives TTL expiry.
 func (r *Reaper) loop(idx uint32) {
 	defer r.wg.Done()
 	s := r.shards[idx]
@@ -299,6 +315,7 @@ func (r *Reaper) loop(idx uint32) {
 	}
 }
 
+// processExpired pops all entries whose deadline has passed and invokes the handler.
 func (r *Reaper) processExpired(s *reaperShard) {
 	now := time.Now()
 	s.mu.Lock()
@@ -335,6 +352,7 @@ func (r *Reaper) processExpired(s *reaperShard) {
 	r.metrics.LoopIterations.Add(1)
 }
 
+// Touch resets the TTL for the given ID, creating the entry if it does not exist.
 func (r *Reaper) Touch(id string) {
 	if r.stopped.Load() {
 		return
@@ -363,6 +381,7 @@ func (r *Reaper) Touch(id string) {
 	}
 }
 
+// TouchAt registers or updates an entry with an explicit expiry deadline.
 func (r *Reaper) TouchAt(id string, deadline time.Time) {
 	if r.stopped.Load() {
 		return
@@ -390,6 +409,7 @@ func (r *Reaper) TouchAt(id string, deadline time.Time) {
 	}
 }
 
+// Remove cancels the TTL for the given ID. Returns true if the entry existed.
 func (r *Reaper) Remove(id string) bool {
 	if r.stopped.Load() {
 		return false
@@ -410,6 +430,7 @@ func (r *Reaper) Remove(id string) bool {
 	return false
 }
 
+// Clear removes all tracked entries and returns how many were removed.
 func (r *Reaper) Clear() int {
 	if r.stopped.Load() {
 		return 0
@@ -430,6 +451,7 @@ func (r *Reaper) Clear() int {
 	return count
 }
 
+// Count returns the number of entries currently tracked across all shards.
 func (r *Reaper) Count() int {
 	if r.stopped.Load() {
 		return 0
@@ -443,6 +465,7 @@ func (r *Reaper) Count() int {
 	return count
 }
 
+// Deadline returns the earliest expiry time across all shards, or false if empty.
 func (r *Reaper) Deadline() (time.Time, bool) {
 	if r.stopped.Load() {
 		return time.Time{}, false
@@ -463,6 +486,7 @@ func (r *Reaper) Deadline() (time.Time, bool) {
 	return earliest, found
 }
 
+// Stop shuts down all reaper goroutines and releases internal resources.
 func (r *Reaper) Stop() {
 	if !r.stopped.CompareAndSwap(false, true) {
 		return

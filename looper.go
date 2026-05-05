@@ -24,6 +24,7 @@ type LoopConfig struct {
 	Logger      *ll.Logger
 }
 
+// validate clamps or rejects configuration values that are out of range.
 func (c *LoopConfig) validate() {
 	if c.Interval <= 0 {
 		c.Interval = time.Second
@@ -66,6 +67,7 @@ type LooperMetrics struct {
 	CurrentBackoffNs  atomic.Int64
 }
 
+// recordExecution updates timing and error metrics after each loop iteration.
 func (m *LooperMetrics) recordExecution(start time.Time, err error) {
 	m.Executions.Add(1)
 	m.LastRun.Store(start)
@@ -110,6 +112,7 @@ func (m *LooperMetrics) recordExecution(start time.Time, err error) {
 	}
 }
 
+// recordPanic increments the panic counter and logs the recovered value.
 func (m *LooperMetrics) recordPanic() {
 	m.PanicsRecovered.Add(1)
 	m.LastError.Store(&CaughtPanic{Value: "panic in looper task"})
@@ -133,10 +136,12 @@ type Looper struct {
 
 type LooperOption func(*LoopConfig)
 
+// WithLooperName sets the display name used in logs and metrics.
 func WithLooperName(name string) LooperOption {
 	return func(c *LoopConfig) { c.Name = name }
 }
 
+// WithLooperInterval sets the base interval between loop iterations.
 func WithLooperInterval(interval time.Duration) LooperOption {
 	return func(c *LoopConfig) {
 		if interval > 0 {
@@ -145,30 +150,37 @@ func WithLooperInterval(interval time.Duration) LooperOption {
 	}
 }
 
+// WithLooperJitter adds proportional random jitter to each interval to spread load.
 func WithLooperJitter(jitter float64) LooperOption {
 	return func(c *LoopConfig) { c.Jitter = jitter }
 }
 
+// WithLooperBackoff enables exponential backoff on consecutive errors.
 func WithLooperBackoff(enabled bool) LooperOption {
 	return func(c *LoopConfig) { c.Backoff = enabled }
 }
 
+// WithLooperMaxInterval caps the backoff interval ceiling.
 func WithLooperMaxInterval(max time.Duration) LooperOption {
 	return func(c *LoopConfig) { c.MaxInterval = max }
 }
 
+// WithLooperMinInterval sets the floor below which the interval will not drop.
 func WithLooperMinInterval(min time.Duration) LooperOption {
 	return func(c *LoopConfig) { c.MinInterval = min }
 }
 
+// WithLooperImmediate makes the looper execute fn once before the first timer fires.
 func WithLooperImmediate(immediate bool) LooperOption {
 	return func(c *LoopConfig) { c.Immediate = immediate }
 }
 
+// WithLooperContext attaches an external context; cancelling it stops the looper.
 func WithLooperContext(ctx context.Context) LooperOption {
 	return func(c *LoopConfig) { c.Context = ctx }
 }
 
+// WithLooperLogger sets a custom logger for the looper.
 func WithLooperLogger(logger *ll.Logger) LooperOption {
 	return func(c *LoopConfig) { c.Logger = logger }
 }
@@ -219,6 +231,7 @@ func (l *Looper) Metrics() *LooperMetrics {
 	return l.metrics
 }
 
+// Start launches the looper goroutine. Safe to call only once.
 func (l *Looper) Start() {
 	if l.running.Swap(true) {
 		return
@@ -234,6 +247,7 @@ func (l *Looper) Start() {
 	}
 }
 
+// Stop signals the looper to exit and blocks until it does.
 func (l *Looper) Stop() {
 	l.stopOnce.Do(func() {
 		l.logger.Info("looper stopping")
@@ -244,6 +258,7 @@ func (l *Looper) Stop() {
 	})
 }
 
+// SetInterval updates the iteration interval dynamically; takes effect on the next tick.
 func (l *Looper) SetInterval(d time.Duration) {
 	if d <= 0 {
 		return
@@ -262,23 +277,28 @@ func (l *Looper) SetInterval(d time.Duration) {
 	}
 }
 
+// ResetInterval restores the interval to the value set at construction time.
 func (l *Looper) ResetInterval() {
 	l.SetInterval(l.config.Interval)
 	l.metrics.CurrentBackoffNs.Store(0)
 }
 
+// CurrentInterval returns the interval currently in use, including any backoff applied.
 func (l *Looper) CurrentInterval() time.Duration {
 	return time.Duration(l.currentInterval.Load())
 }
 
+// IsRunning reports whether the looper goroutine is active.
 func (l *Looper) IsRunning() bool {
 	return l.running.Load()
 }
 
+// FailureCount returns the number of consecutive errors since the last success.
 func (l *Looper) FailureCount() uint64 {
 	return l.failureCount.Load()
 }
 
+// run is the looper's main goroutine: ticks, executes fn, and handles backoff.
 func (l *Looper) run() {
 	defer l.wg.Done()
 	defer func() {
@@ -309,6 +329,7 @@ func (l *Looper) run() {
 	}
 }
 
+// execute calls safeExecute and records the outcome in metrics.
 func (l *Looper) execute() {
 	start := time.Now()
 	err := l.safeExecute()
@@ -331,6 +352,7 @@ func (l *Looper) execute() {
 	l.logger.Debug("execution completed in %v", time.Since(start))
 }
 
+// safeExecute calls fn with panic recovery; returns the panic as an error.
 func (l *Looper) safeExecute() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -344,6 +366,7 @@ func (l *Looper) safeExecute() (err error) {
 	return l.task()
 }
 
+// applyBackoff doubles the current interval up to maxInterval on consecutive errors.
 func (l *Looper) applyBackoff() {
 	failures := l.failureCount.Load()
 	multiplier := math.Pow(2, float64(failures-1))
@@ -359,6 +382,7 @@ func (l *Looper) applyBackoff() {
 	l.logger.Debug("backoff applied: %v (failures=%d)", backoff, failures)
 }
 
+// calculateInterval returns the interval plus any configured jitter.
 func (l *Looper) calculateInterval(base time.Duration) time.Duration {
 	if l.config.Jitter <= 0 {
 		return base
@@ -368,6 +392,7 @@ func (l *Looper) calculateInterval(base time.Duration) time.Duration {
 	return time.Duration(float64(base) * factor)
 }
 
+// sleep waits for d or until the looper's stop signal fires.
 func (l *Looper) sleep(d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
