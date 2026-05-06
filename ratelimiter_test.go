@@ -87,7 +87,7 @@ func TestRateLimiterBlockingAcquire(t *testing.T) {
 }
 
 func TestRateLimiterPriorityOrdering(t *testing.T) {
-	rl := NewRateLimiter(0, 1) // No refill, single token
+	rl := NewRateLimiter(0, 1)
 	defer rl.Close()
 
 	if !rl.Allow(PriorityLow) {
@@ -210,7 +210,6 @@ func TestRateLimiterMetrics(t *testing.T) {
 }
 
 func TestRateLimiterConcurrentStress(t *testing.T) {
-	// Very low rate with small burst to guarantee contention
 	rl := NewRateLimiter(1, 2)
 	defer rl.Close()
 
@@ -263,5 +262,77 @@ func TestRateLimiterOptions(t *testing.T) {
 
 	if rl.maxWait != 200*time.Millisecond {
 		t.Fatalf("expected maxWait 200ms, got %v", rl.maxWait)
+	}
+}
+
+func TestRateLimiterReplenish(t *testing.T) {
+	rl := NewRateLimiter(0, 5)
+	defer rl.Close()
+
+	for i := 0; i < 5; i++ {
+		rl.Allow(PriorityHigh)
+	}
+	if rl.Tokens() != 0 {
+		t.Fatalf("expected 0 tokens after full consumption, got %d", rl.Tokens())
+	}
+
+	rl.Replenish(3)
+	if rl.Tokens() != 3 {
+		t.Fatalf("expected 3 tokens after Replenish(3), got %d", rl.Tokens())
+	}
+
+	rl.Replenish(100)
+	if rl.Tokens() != 5 {
+		t.Fatalf("expected tokens capped at burst=5, got %d", rl.Tokens())
+	}
+}
+
+func TestRateLimiterTokensAndBurst(t *testing.T) {
+	rl := NewRateLimiter(0, 10)
+	defer rl.Close()
+
+	if rl.Burst() != 10 {
+		t.Fatalf("expected burst 10, got %d", rl.Burst())
+	}
+	if rl.Tokens() != 10 {
+		t.Fatalf("expected 10 tokens initially, got %d", rl.Tokens())
+	}
+	rl.Allow(PriorityHigh)
+	if rl.Tokens() != 9 {
+		t.Fatalf("expected 9 tokens after one allow, got %d", rl.Tokens())
+	}
+}
+
+func TestRateLimiterQueueDepthAccuracy(t *testing.T) {
+	rl := NewRateLimiter(0, 1)
+	defer rl.Close()
+
+	if !rl.Allow(PriorityHigh) {
+		t.Fatal("expected initial allow")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			rl.Acquire(ctx, PriorityHigh) //nolint:errcheck
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	depth := rl.Metrics().QueueDepth.Load()
+	if depth < 1 {
+		t.Fatalf("expected queue depth >= 1 while waiters blocked, got %d", depth)
+	}
+
+	rl.Release()
+	wg.Wait()
+
+	time.Sleep(10 * time.Millisecond)
+	if d := rl.Metrics().QueueDepth.Load(); d != 0 {
+		t.Fatalf("expected queue depth 0 after all waiters finished, got %d", d)
 	}
 }
