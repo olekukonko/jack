@@ -181,6 +181,10 @@ func (s *Semaphore) Release() {
 	s.metrics.Released.Add(1)
 
 	for {
+		if s.closed.Load() {
+			return
+		}
+
 		s.queueMu.Lock()
 		w := s.findWaiterLocked()
 		s.queueMu.Unlock()
@@ -198,6 +202,10 @@ func (s *Semaphore) Release() {
 				return
 			}
 			if s.available.CompareAndSwap(avail, avail-1) {
+				if w.cancelled.Load() {
+					s.available.Add(1)
+					break
+				}
 				w.closeCh()
 				s.metrics.AcquiredSlow.Add(1)
 				s.metrics.QueueDepth.Add(-1)
@@ -276,7 +284,7 @@ func (s *Semaphore) findWaiterLocked() *waiter {
 			} else if time.Duration(now-fa) > s.interval {
 				s.dropping.Store(true)
 			}
-		} else if sojourn < s.targetSojourn/2 {
+		} else {
 			s.dropping.Store(false)
 			s.firstAbove.Store(0)
 		}
@@ -340,7 +348,6 @@ func (s *Semaphore) resize(delta int) {
 		s.available.Add(int64(delta))
 		return
 	}
-	// Remove free slots only — never starve in-flight callers.
 	for i := 0; i < -delta; i++ {
 		for {
 			avail := s.available.Load()
