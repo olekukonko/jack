@@ -40,6 +40,9 @@ type Future[T any] struct {
 	ctx      context.Context
 }
 
+// NewFuture creates a Future that executes fn asynchronously in a new goroutine.
+// The context governs cancellation; fn receives it directly. If fn is nil,
+// the Future is returned in an already-failed state.
 func NewFuture[T any](ctx context.Context, fn func(context.Context) (T, error)) *Future[T] {
 	if fn == nil {
 		f := &Future[T]{done: make(chan struct{})}
@@ -62,6 +65,7 @@ func NewFuture[T any](ctx context.Context, fn func(context.Context) (T, error)) 
 	return f
 }
 
+// execute runs fn inside a goroutine, stores the result, and closes done.
 func (f *Future[T]) execute() {
 	defer f.wg.Done()
 
@@ -114,14 +118,17 @@ func (f *Future[T]) execute() {
 	}
 }
 
+// Cancel signals the Future to stop. Returns true if this call caused the cancellation.
 func (f *Future[T]) Cancel() bool {
 	return f.canceled.CompareAndSwap(false, true)
 }
 
+// IsCanceled reports whether the Future was cancelled before completing.
 func (f *Future[T]) IsCanceled() bool {
 	return f.canceled.Load()
 }
 
+// IsDone reports whether the Future has finished, either successfully or with an error.
 func (f *Future[T]) IsDone() bool {
 	select {
 	case <-f.done:
@@ -131,6 +138,7 @@ func (f *Future[T]) IsDone() bool {
 	}
 }
 
+// Await blocks until the Future completes and returns its result and any error.
 func (f *Future[T]) Await() (T, error) {
 	<-f.done
 	f.wg.Wait()
@@ -144,6 +152,8 @@ func (f *Future[T]) Await() (T, error) {
 	return f.result, nil
 }
 
+// AwaitWithTimeout blocks until the Future completes or timeout elapses.
+// Returns ErrFutureTimeout if the deadline is exceeded.
 func (f *Future[T]) AwaitWithTimeout(timeout time.Duration) (T, error) {
 	select {
 	case <-f.done:
@@ -161,6 +171,7 @@ func (f *Future[T]) AwaitWithTimeout(timeout time.Duration) (T, error) {
 	}
 }
 
+// AwaitWithContext blocks until the Future completes or ctx is cancelled.
 func (f *Future[T]) AwaitWithContext(ctx context.Context) (T, error) {
 	select {
 	case <-f.done:
@@ -176,6 +187,8 @@ func (f *Future[T]) AwaitWithContext(ctx context.Context) (T, error) {
 	}
 }
 
+// Then chains a transformation on a successful result, returning a new Future.
+// The chained fn is called only if the original Future completes without error.
 func (f *Future[T]) Then(ctx context.Context, fn func(T) (any, error)) *Future[any] {
 	select {
 	case <-f.done:
@@ -203,6 +216,8 @@ func (f *Future[T]) Then(ctx context.Context, fn func(T) (any, error)) *Future[a
 	}
 }
 
+// Recover chains an error handler that can substitute a value when the Future fails.
+// The handler fn is called only if the original Future returns a non-nil error.
 func (f *Future[T]) Recover(ctx context.Context, fn func(error) (T, error)) *Future[T] {
 	select {
 	case <-f.done:
@@ -230,16 +245,20 @@ func (f *Future[T]) Recover(ctx context.Context, fn func(error) (T, error)) *Fut
 	}
 }
 
+// Async runs fn in a new goroutine and returns a Future for its result.
 func Async[T any](fn func() (T, error)) *Future[T] {
 	return NewFuture(context.Background(), func(context.Context) (T, error) {
 		return fn()
 	})
 }
 
+// AsyncWithContext runs fn in a new goroutine under the given context.
 func AsyncWithContext[T any](ctx context.Context, fn func(context.Context) (T, error)) *Future[T] {
 	return NewFuture(ctx, fn)
 }
 
+// WaitAll blocks until all futures complete and returns their results in order.
+// Returns an error immediately if any Future fails.
 func WaitAll[T any](futures ...*Future[T]) ([]T, error) {
 	results := make([]T, len(futures))
 	for i, f := range futures {
@@ -258,6 +277,8 @@ type waitAnyResult[T any] struct {
 	err   error
 }
 
+// WaitAny blocks until the first Future completes and returns its index and value.
+// Remaining futures continue running; only the first result is returned.
 func WaitAny[T any](futures ...*Future[T]) (int, T, error) {
 	n := len(futures)
 	if n == 0 {
@@ -277,6 +298,7 @@ func WaitAny[T any](futures ...*Future[T]) (int, T, error) {
 	return waitAnyReflect(futures...)
 }
 
+// waitAnyGeneric waits for the first Future to complete using channel selection.
 func waitAnyGeneric[T any](futures ...*Future[T]) (int, T, error) {
 	resultCh := make(chan waitAnyResult[T], 1)
 
@@ -297,6 +319,7 @@ func waitAnyGeneric[T any](futures ...*Future[T]) (int, T, error) {
 	return res.index, res.val, res.err
 }
 
+// waitAnyReflect waits for the first Future using reflect.Select for large slices.
 func waitAnyReflect[T any](futures ...*Future[T]) (int, T, error) {
 	cases := make([]reflect.SelectCase, len(futures))
 	for i, f := range futures {
@@ -310,6 +333,8 @@ func waitAnyReflect[T any](futures ...*Future[T]) (int, T, error) {
 	return chosen, val, err
 }
 
+// Select blocks until ctx is cancelled or the first Future completes.
+// Returns the index and value of the winning Future.
 func Select[T any](ctx context.Context, futures ...*Future[T]) (int, T, error) {
 	n := len(futures)
 	if n == 0 {
@@ -331,6 +356,7 @@ func Select[T any](ctx context.Context, futures ...*Future[T]) (int, T, error) {
 	return selectReflect(ctx, futures...)
 }
 
+// selectReflect selects the first completing Future via reflect.Select.
 func selectReflect[T any](ctx context.Context, futures ...*Future[T]) (int, T, error) {
 	cases := make([]reflect.SelectCase, 0, len(futures)+1)
 	cases = append(cases, reflect.SelectCase{
