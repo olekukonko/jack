@@ -86,7 +86,7 @@ func RetryWithOnRetry(fn func(attempt int, err error)) RetryOption {
 
 // Retry defines how retries are performed. Create one once and reuse it
 // across many Do / DoCtx calls — it is safe for concurrent use.
-type  struct {
+type Retry struct {
 	maxAttempts int
 	baseDelay   time.Duration
 	maxDelay    time.Duration
