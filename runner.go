@@ -206,25 +206,23 @@ func (r *Runner) process() {
 			r.opts.observable.Notify(Event{Type: "run", WorkerID: runnerWorkerID, TaskID: taskID, Time: time.Now()})
 		}
 		startTime := time.Now()
-		errCh := make(chan error, 1)
-		executeDone := make(chan struct{})
+		resultCh := make(chan error, 1)
 		go func() {
+			var taskErr error
 			defer func() {
 				if rec := recover(); rec != nil {
-					errCh <- &CaughtPanic{Value: rec, Stack: debug.Stack()}
 					r.logger.Info("PANIC in runner task execution (TaskID %s): %v", taskID, rec)
+					taskErr = &CaughtPanic{Value: rec, Stack: debug.Stack()}
 				}
-				close(executeDone)
+				resultCh <- taskErr
 			}()
-			errCh <- job.Run(originalCtx)
+			taskErr = job.Run(originalCtx)
 		}()
 		var err error
 		select {
-		case <-executeDone:
-			err = <-errCh
+		case err = <-resultCh:
 		case <-originalCtx.Done():
-			<-executeDone
-			err = <-errCh
+			err = <-resultCh // wait for goroutine to finish even on cancel
 			if err == nil {
 				err = originalCtx.Err()
 			}

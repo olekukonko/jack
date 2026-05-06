@@ -306,7 +306,7 @@ func TestRunner_TaskIDGeneration(t *testing.T) {
 	if !ok {
 		t.Fatal("Event for taskWithID not found")
 	}
-	collector.events = []Event{}
+	collector.reset()
 
 	taskNoID := Func(func() error { return nil })
 	runner1.Do(taskNoID)
@@ -323,7 +323,7 @@ func TestRunner_TaskIDGeneration(t *testing.T) {
 	if _, err := ulid.Parse(strings.TrimPrefix(taskID, "runner.")); err != nil {
 		t.Errorf("Expected valid ULID after 'runner.', got %s", taskID)
 	}
-	collector.events = []Event{}
+	collector.reset()
 
 	customGen := func(taskInput interface{}) string { return "customRunnerID" }
 	runner2 := NewRunner(WithRunnerObservable(obsable), WithRunnerIDGenerator(customGen))
