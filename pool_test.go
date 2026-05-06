@@ -133,6 +133,7 @@ func (t *testCtxTask) getReceivedContext() context.Context {
 type eventCollector struct {
 	mu     sync.Mutex // Protects events
 	events []Event    // Collected events
+	cursor int        // Index of next unconsumed event for waitForEvent
 }
 
 // newEventCollector creates a new event collector for test event observation.
@@ -147,6 +148,15 @@ func (ec *eventCollector) OnNotify(event Event) {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
 	ec.events = append(ec.events, event)
+}
+
+// reset clears all collected events and resets the cursor.
+// Thread-safe via mutex.
+func (ec *eventCollector) reset() {
+	ec.mu.Lock()
+	defer ec.mu.Unlock()
+	ec.events = []Event{}
+	ec.cursor = 0
 }
 
 // getEvents returns a copy of all collected events.
@@ -175,17 +185,26 @@ func (ec *eventCollector) findEvents(taskID string, eventType string) []Event {
 	return found
 }
 
-// waitForEvent waits for an event with the specified taskID and type within the timeout.
-// It returns the event and a boolean indicating success.
+// waitForEvent waits for the next unconsumed event matching taskID and eventType within timeout.
+// Scans from the shared cursor without advancing it for non-matches, so events skipped by one
+// filter remain visible to calls with a different filter. Cursor advances only on a match.
 // Thread-safe via mutex.
 func (ec *eventCollector) waitForEvent(t *testing.T, taskID string, eventType string, timeout time.Duration) (Event, bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		events := ec.findEvents(taskID, eventType)
-		if len(events) > 0 {
-			return events[0], true
+		ec.mu.Lock()
+		for i := ec.cursor; i < len(ec.events); i++ {
+			e := ec.events[i]
+			matchID := (taskID == "" || e.TaskID == taskID)
+			matchType := (eventType == "" || e.Type == eventType)
+			if matchID && matchType {
+				ec.cursor = i + 1
+				ec.mu.Unlock()
+				return e, true
+			}
 		}
+		ec.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
 	return Event{}, false
@@ -561,7 +580,7 @@ func TestPool_TaskIDGeneration(t *testing.T) {
 	if !ok {
 		t.Fatal("Event for taskWithID not found")
 	}
-	collector.events = []Event{}
+	collector.reset()
 
 	taskNoID := Func(func() error { return nil })
 	pool.Submit(taskNoID)
@@ -578,7 +597,7 @@ func TestPool_TaskIDGeneration(t *testing.T) {
 	if _, err := ulid.Parse(strings.TrimPrefix(taskID, "task.")); err != nil {
 		t.Errorf("Expected valid ULID after 'task.', got %s", taskID)
 	}
-	collector.events = []Event{}
+	collector.reset()
 
 	customGen := func(taskInput interface{}) string { return "customPoolID" }
 	pool2 := NewPool(1, PoolingWithObservable(obsable), PoolingWithIDGenerator(customGen))
