@@ -139,6 +139,64 @@ func TestThrottleMetrics(t *testing.T) {
 	}
 }
 
+func TestThrottlePerPriorityMetrics(t *testing.T) {
+	at := NewThrottle(4)
+	defer at.Close()
+
+	for i := 0; i < 20; i++ {
+		at.Rejected(PriorityLow)
+	}
+
+	m := at.Metrics()
+	if m.ThrottleProbs[int(PriorityLow)].Load() == 0 {
+		t.Fatal("expected non-zero throttle probability for PriorityLow")
+	}
+	if m.ThrottleProbs[int(PriorityCritical)].Load() != 0 {
+		t.Fatal("expected zero throttle probability for PriorityCritical (unaffected tier)")
+	}
+}
+
+func TestThrottleProbabilityMethod(t *testing.T) {
+	at := NewThrottle(4)
+	defer at.Close()
+
+	if p := at.Probability(PriorityHigh); p != 0 {
+		t.Fatalf("expected 0 probability before signals, got %f", p)
+	}
+
+	for i := 0; i < 20; i++ {
+		at.Rejected(PriorityHigh)
+	}
+
+	if p := at.Probability(PriorityHigh); p <= 0 {
+		t.Fatal("expected positive probability after rejections")
+	}
+	if p := at.Probability(PriorityHigh); p > 1 {
+		t.Fatalf("probability must not exceed 1.0, got %f", p)
+	}
+}
+
+func TestThrottleWindowResetSamples(t *testing.T) {
+	at := NewThrottle(4, ThrottleWithWindowResetSamples(20))
+	defer at.Close()
+
+	for i := 0; i < 20; i++ {
+		at.Rejected(PriorityHigh)
+	}
+	probAfterRejections := at.Probability(PriorityHigh)
+	if probAfterRejections <= 0 {
+		t.Fatal("expected positive probability after 20 rejections")
+	}
+
+	for i := 0; i < 200; i++ {
+		at.Accepted(PriorityHigh)
+	}
+	probAfterRecovery := at.Probability(PriorityHigh)
+	if probAfterRecovery >= probAfterRejections {
+		t.Fatal("expected probability to decrease after many accepted signals")
+	}
+}
+
 func TestThrottleConcurrentStress(t *testing.T) {
 	at := NewThrottle(4)
 	defer at.Close()
@@ -172,6 +230,7 @@ func TestThrottleOptions(t *testing.T) {
 	at := NewThrottle(4,
 		ThrottleWithRatio(3.0),
 		ThrottleWithWindow(30*time.Second),
+		ThrottleWithWindowResetSamples(500),
 	)
 	defer at.Close()
 
@@ -180,6 +239,9 @@ func TestThrottleOptions(t *testing.T) {
 	}
 	if at.window != 30*time.Second {
 		t.Fatalf("expected window 30s, got %v", at.window)
+	}
+	if at.windowResetSamples != 500 {
+		t.Fatalf("expected windowResetSamples 500, got %d", at.windowResetSamples)
 	}
 }
 
