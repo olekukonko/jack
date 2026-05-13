@@ -362,6 +362,19 @@ func (lm *Lifetime) processExpired(s *shard) {
 	lm.metrics.LoopIterations.Add(1)
 }
 
+// Schedule schedules a FuncCtx operation to execute after the specified wait duration for a given ID.
+// This is a convenience wrapper around ScheduleTimed that accepts jack.FuncCtx type callbacks.
+// If a timer already exists for the ID, it is replaced with the new callback and expiration time.
+func (lm *Lifetime) Schedule(ctx context.Context, id string, operation FuncCtx, wait time.Duration) {
+	if operation == nil {
+		return
+	}
+	callback := func(ctx context.Context, id string) {
+		operation(ctx)
+	}
+	lm.ScheduleTimed(ctx, id, callback, wait)
+}
+
 // ScheduleTimed registers a callback to execute after the specified wait duration for a given ID.
 // If a timer already exists for the ID, it is replaced with the new callback and expiration time.
 // The method uses sharding for concurrency and signals the prune loop to re-evaluate scheduling.
