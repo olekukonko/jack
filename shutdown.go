@@ -1,3 +1,4 @@
+// shutdown.go
 package jack
 
 import (
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"reflect"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -55,14 +57,16 @@ func ShutdownWithLogger(l *ll.Logger) ShutdownOption {
 
 // Shutdown manages the graceful shutdown process.
 type Shutdown struct {
-	mu          sync.RWMutex
-	signalChan  chan os.Signal
-	doneChan    chan struct{}
-	forceQuit   chan struct{}
-	events      []namedCall
-	inShutdown  atomic.Bool
-	shutdownCtx context.Context
-	cancelFunc  context.CancelFunc
+	mu              sync.RWMutex
+	signalChan      chan os.Signal
+	doneChan        chan struct{}
+	forceQuit       chan struct{}
+	events          []namedCall
+	priorityEvents  map[int][]namedCall
+	usePrioritySort bool
+	inShutdown      atomic.Bool
+	shutdownCtx     context.Context
+	cancelFunc      context.CancelFunc
 
 	timeout          time.Duration
 	concurrent       bool
@@ -75,11 +79,11 @@ type Shutdown struct {
 }
 
 type namedCall struct {
-	Name string
-	Fn   FuncCtx
+	Name     string
+	Fn       FuncCtx
+	Priority int
 }
 
-// ShutdownStats contains metrics about the shutdown execution.
 type ShutdownStats struct {
 	TotalEvents     int
 	CompletedEvents int
@@ -100,8 +104,9 @@ func NewShutdown(opts ...ShutdownOption) *Shutdown {
 			syscall.SIGTERM,
 			syscall.SIGQUIT,
 		},
-		doneChan: make(chan struct{}),
-		stats:    &ShutdownStats{Errors: make([]error, 0)},
+		doneChan:       make(chan struct{}),
+		priorityEvents: make(map[int][]namedCall),
+		stats:          &ShutdownStats{Errors: make([]error, 0)},
 	}
 	if logger != nil {
 		sm.logger = logger.Namespace("shutdown")
@@ -172,27 +177,48 @@ func (sm *Shutdown) Register(fn any) error {
 	default:
 		return fmt.Errorf("unsupported callback type: %T", fn)
 	}
-	return sm.registerCall(name, call)
+	return sm.registerCall(name, call, 0)
 }
 
-// RegisterFunc registers a simple void function.
-// Convenience wrapper around Register; name is auto-generated if empty.
-// Useful for quick registration of fire-and-forget cleanup.
+func (sm *Shutdown) RegisterWithPriority(name string, priority int, fns ...FuncCtx) error {
+	if len(fns) == 0 {
+		return errors.New("at least one function required")
+	}
+	if sm.IsShuttingDown() {
+		return errors.New("cannot register after shutdown started")
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for _, fn := range fns {
+		if fn == nil {
+			return errors.New("callback cannot be nil")
+		}
+		wrapped := sm.wrapWithPanicRecovery(name, fn)
+		sm.priorityEvents[priority] = append(sm.priorityEvents[priority], namedCall{
+			Name:     name,
+			Fn:       wrapped,
+			Priority: priority,
+		})
+		sm.statsMu.Lock()
+		sm.stats.TotalEvents++
+		sm.statsMu.Unlock()
+	}
+	sm.usePrioritySort = true
+	return nil
+}
+
 func (sm *Shutdown) RegisterFunc(name string, fn func()) error {
 	if fn == nil {
 		return errors.New("callback cannot be nil")
 	}
-	return sm.registerCall(name, func(ctx context.Context) error { fn(); return nil })
+	return sm.registerCall(name, func(ctx context.Context) error { fn(); return nil }, 0)
 }
 
-// RegisterCall registers a simple function returning an error.
-// Convenience wrapper around Register; supports jack.Func signature.
-// Name is auto-generated when empty string is provided.
 func (sm *Shutdown) RegisterCall(name string, fn Func) error {
 	if fn == nil {
 		return errors.New("callback cannot be nil")
 	}
-	return sm.registerCall(name, func(ctx context.Context) error { return fn() })
+	return sm.registerCall(name, func(ctx context.Context) error { return fn() }, 0)
 }
 
 // RegisterCloser registers an io.Closer.
@@ -205,18 +231,17 @@ func (sm *Shutdown) RegisterCloser(name string, closer io.Closer) error {
 	if name == "" {
 		name = fmt.Sprintf("closer:%T", closer)
 	}
-	return sm.registerCall(name, func(ctx context.Context) error { return closer.Close() })
+	return sm.registerCall(name, func(ctx context.Context) error { return closer.Close() }, 0)
 }
 
 // RegisterWithContext registers a fully context-aware callback.
 // Allows explicit naming and direct use of jack.FuncCtx functions.
 // Preferred for advanced cleanup needing cancellation/timeout awareness.
 func (sm *Shutdown) RegisterWithContext(name string, fn FuncCtx) error {
-	return sm.registerCall(name, fn)
+	return sm.registerCall(name, fn, 0)
 }
 
-// registerCall wraps fn with panic recovery and appends it to the event list.
-func (sm *Shutdown) registerCall(name string, fn FuncCtx) error {
+func (sm *Shutdown) registerCall(name string, fn FuncCtx, priority int) error {
 	if fn == nil {
 		return errors.New("callback cannot be nil")
 	}
@@ -231,7 +256,16 @@ func (sm *Shutdown) registerCall(name string, fn FuncCtx) error {
 	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	wrapped := func(ctx context.Context) (err error) {
+	wrapped := sm.wrapWithPanicRecovery(name, fn)
+	sm.events = append(sm.events, namedCall{Name: name, Fn: wrapped, Priority: priority})
+	sm.statsMu.Lock()
+	sm.stats.TotalEvents++
+	sm.statsMu.Unlock()
+	return nil
+}
+
+func (sm *Shutdown) wrapWithPanicRecovery(name string, fn FuncCtx) FuncCtx {
+	return func(ctx context.Context) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
 				err = &ShutdownError{
@@ -247,11 +281,6 @@ func (sm *Shutdown) registerCall(name string, fn FuncCtx) error {
 		}
 		return nil
 	}
-	sm.events = append(sm.events, namedCall{Name: name, Fn: wrapped})
-	sm.statsMu.Lock()
-	sm.stats.TotalEvents++
-	sm.statsMu.Unlock()
-	return nil
 }
 
 // Wait blocks until a signal is received or TriggerShutdown is called,
@@ -300,16 +329,38 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 		return sm.GetStats()
 	}
 	sm.mu.Lock()
-	events := sm.events
+
+	// Snapshot and clear state while holding the lock.
+	regularEvents := make([]namedCall, len(sm.events))
+	for i, e := range sm.events {
+		regularEvents[i] = e
+	}
+	// Reverse for LIFO.
+	for i, j := 0, len(regularEvents)-1; i < j; i, j = i+1, j-1 {
+		regularEvents[i], regularEvents[j] = regularEvents[j], regularEvents[i]
+	}
+
+	priorityEvents := sm.priorityEvents
+	usePriority := sm.usePrioritySort
+
 	sm.events = nil
+	sm.priorityEvents = nil
 	sm.mu.Unlock()
+
+	// Count total events for stats.
+	total := len(regularEvents)
+	if usePriority {
+		for _, group := range priorityEvents {
+			total += len(group)
+		}
+	}
 
 	sm.statsMu.Lock()
 	sm.stats.StartTime = time.Now()
-	sm.stats.TotalEvents = len(events)
+	sm.stats.TotalEvents = total
 	sm.statsMu.Unlock()
 
-	sm.log("starting shutdown of %d task(s)", len(events))
+	sm.log("starting shutdown of %d task(s)", total)
 
 	var cleanupCtx context.Context
 	var cleanupCancel context.CancelFunc
@@ -320,11 +371,41 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 	}
 	defer cleanupCancel()
 
-	if len(events) > 0 {
+	if usePriority && len(priorityEvents) > 0 {
+		// Execute priority groups as sequential waves — within each wave,
+		// tasks run concurrently (or sequentially if not sm.concurrent).
+		// This means Listeners (priority 0) fully completes before
+		// TrafficManager (priority 1) starts, preserving the ordering
+		// guarantee even when ShutdownConcurrent() is configured.
+		keys := make([]int, 0, len(priorityEvents))
+		for k := range priorityEvents {
+			keys = append(keys, k)
+		}
+		sort.Ints(keys)
+
+		for _, k := range keys {
+			group := priorityEvents[k]
+			// LIFO within each priority group.
+			wave := make([]namedCall, len(group))
+			for i, e := range group {
+				wave[len(group)-1-i] = e
+			}
+			sm.log("running priority group %d (%d task(s))", k, len(wave))
+			if sm.concurrent {
+				sm.executeConcurrent(wave, cleanupCtx)
+			} else {
+				sm.executeSequential(wave, cleanupCtx)
+			}
+		}
+	}
+
+	// Regular events (RegisterFunc / Register) run last, after all priority
+	// groups have completed.
+	if len(regularEvents) > 0 {
 		if sm.concurrent {
-			sm.executeConcurrent(events, cleanupCtx)
+			sm.executeConcurrent(regularEvents, cleanupCtx)
 		} else {
-			sm.executeSequential(events, cleanupCtx)
+			sm.executeSequential(regularEvents, cleanupCtx)
 		}
 	}
 
@@ -343,9 +424,8 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 // Blocks until all tasks complete or context is cancelled.
 // Updates completion/failure counters for each task.
 func (sm *Shutdown) executeSequential(events []namedCall, ctx context.Context) {
-	for i := len(events) - 1; i >= 0; i-- {
-		nc := events[i]
-		sm.log("running: %s", nc.Name)
+	for _, nc := range events {
+		sm.log("running: %s (priority: %d)", nc.Name, nc.Priority)
 		if err := nc.Fn(ctx); err != nil {
 			sm.log("task failed: %s -> %v", nc.Name, err)
 			sm.recordError(err)
@@ -370,7 +450,7 @@ func (sm *Shutdown) executeConcurrent(events []namedCall, ctx context.Context) {
 		wg.Add(1)
 		go func(task namedCall) {
 			defer wg.Done()
-			sm.log("running (concurrent): %s", task.Name)
+			sm.log("running (concurrent): %s (priority: %d)", task.Name, task.Priority)
 			errChan <- task.Fn(ctx)
 		}(nc)
 	}

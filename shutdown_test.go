@@ -30,17 +30,14 @@ func TestShutdownDefaults(t *testing.T) {
 
 // TestShutdownTimeout verifies that the global timeout cancels the context.
 func TestShutdownTimeout(t *testing.T) {
-	// Set a very short timeout
 	sm := NewShutdown(ShutdownWithTimeout(50 * time.Millisecond))
 
-	// Trigger shutdown to start the clock
 	go sm.TriggerShutdown()
 
 	select {
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("timeout expected but did not occur")
 	case <-sm.Done():
-		// Success: shutdown finished (likely due to timeout cancelling the context)
 	}
 }
 
@@ -48,18 +45,16 @@ func TestShutdownTimeout(t *testing.T) {
 // if the tasks take too long, even if the main timeout is infinite (0).
 func TestShutdownForceQuit(t *testing.T) {
 	sm := NewShutdown(
-		ShutdownWithTimeout(0), // Infinite wait
+		ShutdownWithTimeout(0),
 		ShutdownWithForceQuit(20*time.Millisecond),
 	)
 
-	// Register a task that blocks longer than the force quit timeout
-	// and respects context cancellation.
 	sm.RegisterWithContext("blocker", func(ctx context.Context) error {
 		select {
 		case <-time.After(1 * time.Second):
 			return nil
 		case <-ctx.Done():
-			return ctx.Err() // Should happen after ~20ms
+			return ctx.Err()
 		}
 	})
 
@@ -84,14 +79,12 @@ func TestShutdownLIFO(t *testing.T) {
 	var order []string
 	var mu sync.Mutex
 
-	// Registered First
 	_ = sm.Register(func() {
 		mu.Lock()
 		order = append(order, "first")
 		mu.Unlock()
 	})
 
-	// Registered Second
 	_ = sm.Register(func() {
 		mu.Lock()
 		order = append(order, "second")
@@ -100,7 +93,6 @@ func TestShutdownLIFO(t *testing.T) {
 
 	sm.executeShutdown()
 
-	// Should execute LIFO: Second, then First
 	if len(order) != 2 || order[0] != "second" || order[1] != "first" {
 		t.Fatalf("wrong order (expected LIFO): %v", order)
 	}
@@ -116,8 +108,6 @@ func TestShutdownConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(3)
 
-	// Register 3 tasks that sleep. If sequential, this would take 300ms.
-	// If concurrent, it should take ~100ms.
 	sleeper := func() {
 		defer wg.Done()
 		time.Sleep(100 * time.Millisecond)
@@ -152,7 +142,6 @@ func TestShutdownPanicRecovery(t *testing.T) {
 	if len(stats.Errors) != 1 {
 		t.Fatal("expected error recorded")
 	}
-	// Verify it's a shutdown error wrapping the panic
 	if stats.Errors[0].Error() == "" {
 		t.Fatal("empty error message")
 	}
@@ -162,15 +151,10 @@ func TestShutdownPanicRecovery(t *testing.T) {
 func TestShutdownTypes(t *testing.T) {
 	sm := NewShutdown()
 
-	// func()
 	sm.Register(func() {})
-	// func() error (jack.Func)
 	sm.Register(func() error { return nil })
-	// func(context.Context) error (jack.FuncCtx)
 	sm.RegisterWithContext("ctx", func(ctx context.Context) error { return nil })
-
 	sm.Register(&fakeCloser{})
-	// Explicit jack.Func
 	sm.Register(Func(func() error { return nil }))
 
 	sm.executeShutdown()
@@ -193,7 +177,6 @@ func TestShutdownSignal(t *testing.T) {
 		ran.Store(true)
 	})
 
-	// Send signal into the unexported channel directly to avoid relying on OS delivery timing
 	go func() {
 		sm.signalChan <- syscall.SIGTERM
 	}()
@@ -241,10 +224,7 @@ func TestShutdownDoubleExecution(t *testing.T) {
 	count := 0
 	sm.Register(func() { count++ })
 
-	// First run
 	sm.executeShutdown()
-
-	// Second run (simulate race or manual call)
 	sm.executeShutdown()
 
 	if count != 1 {
@@ -265,6 +245,449 @@ func TestShutdownError(t *testing.T) {
 	}
 	if !errors.Is(inner, se.Unwrap()) {
 		t.Fatal("Unwrap failed")
+	}
+}
+
+// TestRegisterWithPriorityBasic verifies basic priority ordering works correctly.
+// Priority 0 executes first, then 1, then 2 (ascending).
+// Within each priority: LIFO (last registered in that group runs first).
+func TestRegisterWithPriorityBasic(t *testing.T) {
+	sm := NewShutdown(ShutdownWithTimeout(500 * time.Millisecond))
+
+	var order []string
+	var mu sync.Mutex
+
+	_ = sm.RegisterWithPriority("p2", 2,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "p2a")
+			mu.Unlock()
+			return nil
+		},
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "p2b")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	_ = sm.RegisterWithPriority("p0", 0,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "p0a")
+			mu.Unlock()
+			return nil
+		},
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "p0b")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	_ = sm.RegisterWithPriority("p1", 1,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "p1")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	sm.executeShutdown()
+
+	expected := []string{"p0b", "p0a", "p1", "p2b", "p2a"}
+	if len(order) != len(expected) {
+		t.Fatalf("expected %d items, got %d: %v", len(expected), len(order), order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Fatalf("position %d: expected %s, got %s\nFull order: %v", i, v, order[i], order)
+		}
+	}
+}
+
+// TestRegisterWithPriorityLIFO verifies LIFO ordering within same priority.
+func TestRegisterWithPriorityLIFO(t *testing.T) {
+	sm := NewShutdown(ShutdownWithTimeout(100 * time.Millisecond))
+
+	var order []string
+	var mu sync.Mutex
+
+	sm.RegisterWithPriority("group", 0,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "first-registered")
+			mu.Unlock()
+			return nil
+		},
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "second-registered")
+			mu.Unlock()
+			return nil
+		},
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "third-registered")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	sm.executeShutdown()
+
+	expected := []string{"third-registered", "second-registered", "first-registered"}
+	if len(order) != 3 {
+		t.Fatalf("expected 3 items, got %d: %v", len(order), order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Fatalf("LIFO failed at position %d: expected %s, got %s", i, v, order[i])
+		}
+	}
+}
+
+// TestRegisterWithPriorityMultipleGroups verifies multiple groups at same priority merge correctly.
+func TestRegisterWithPriorityMultipleGroups(t *testing.T) {
+	sm := NewShutdown(ShutdownWithTimeout(100 * time.Millisecond))
+
+	var order []string
+	var mu sync.Mutex
+
+	sm.RegisterWithPriority("group-a", 0,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "a1")
+			mu.Unlock()
+			return nil
+		},
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "a2")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	sm.RegisterWithPriority("group-b", 0,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "b1")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	sm.executeShutdown()
+
+	expected := []string{"b1", "a2", "a1"}
+	if len(order) != len(expected) {
+		t.Fatalf("expected %d items, got %d: %v", len(expected), len(order), order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Fatalf("position %d: expected %s, got %s\nFull order: %v", i, v, order[i], order)
+		}
+	}
+}
+
+// TestRegisterWithPriorityMixedWithNonPriority verifies priority and non-priority tasks coexist.
+func TestRegisterWithPriorityMixedWithNonPriority(t *testing.T) {
+	sm := NewShutdown(ShutdownWithTimeout(500 * time.Millisecond))
+
+	var order []string
+	var mu sync.Mutex
+
+	_ = sm.Register(func() {
+		mu.Lock()
+		order = append(order, "non-priority-1")
+		mu.Unlock()
+	})
+	_ = sm.Register(func() {
+		mu.Lock()
+		order = append(order, "non-priority-2")
+		mu.Unlock()
+	})
+
+	_ = sm.RegisterWithPriority("critical", 0,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "critical")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	_ = sm.RegisterWithPriority("normal", 1,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "normal")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	sm.executeShutdown()
+
+	expected := []string{"critical", "normal", "non-priority-2", "non-priority-1"}
+	if len(order) != len(expected) {
+		t.Fatalf("expected %d items, got %d: %v", len(expected), len(order), order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Fatalf("position %d: expected %s, got %s\nFull order: %v", i, v, order[i], order)
+		}
+	}
+}
+
+// TestRegisterWithPriorityNilFunction verifies nil functions are rejected.
+func TestRegisterWithPriorityNilFunction(t *testing.T) {
+	sm := NewShutdown()
+
+	validFn := func(ctx context.Context) error { return nil }
+	nilFn := FuncCtx(nil)
+
+	err := sm.RegisterWithPriority("test", 0, validFn, nilFn, validFn)
+	if err == nil {
+		t.Fatal("expected error for nil function")
+	}
+	if err.Error() != "callback cannot be nil" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = sm.RegisterWithPriority("empty", 0)
+	if err == nil {
+		t.Fatal("expected error for empty functions")
+	}
+	if err.Error() != "at least one function required" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestRegisterWithPriorityAfterShutdown verifies registration after shutdown is rejected.
+func TestRegisterWithPriorityAfterShutdown(t *testing.T) {
+	sm := NewShutdown()
+	sm.TriggerShutdown()
+
+	err := sm.RegisterWithPriority("late", 0, func(ctx context.Context) error { return nil })
+	if err == nil {
+		t.Fatal("expected error when registering after shutdown")
+	}
+	if err.Error() != "cannot register after shutdown started" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestRegisterWithPriorityPanicRecovery verifies panics in priority functions are caught.
+func TestRegisterWithPriorityPanicRecovery(t *testing.T) {
+	sm := NewShutdown()
+
+	_ = sm.RegisterWithPriority("panicky", 0,
+		func(ctx context.Context) error {
+			panic("priority panic!")
+		},
+	)
+
+	stats := sm.executeShutdown()
+
+	if stats.FailedEvents != 1 {
+		t.Fatalf("expected 1 failure, got %d", stats.FailedEvents)
+	}
+	if len(stats.Errors) != 1 {
+		t.Fatal("expected 1 error recorded")
+	}
+
+	var se *ShutdownError
+	if !errors.As(stats.Errors[0], &se) {
+		t.Fatal("error should be ShutdownError")
+	}
+	if se.Name != "panicky" {
+		t.Fatalf("expected error name 'panicky', got %q", se.Name)
+	}
+}
+
+// TestRegisterWithPriorityConcurrent verifies that within each priority wave,
+// tasks run concurrently — but waves themselves are sequential.
+//
+// Wave semantics with ShutdownConcurrent():
+//   - Priority 0 wave: all p0 tasks start simultaneously, wait for all to finish
+//   - Priority 1 wave: all p1 tasks start simultaneously, wait for all to finish
+//   - Regular tasks: run last
+//
+// Total time = slowest p0 task + slowest p1 task (not all tasks in parallel).
+// This is by design — it ensures Listeners drain before TrafficManager closes,
+// even when concurrent execution is configured.
+func TestRegisterWithPriorityConcurrent(t *testing.T) {
+	sm := NewShutdown(
+		ShutdownWithTimeout(2*time.Second),
+		ShutdownConcurrent(),
+	)
+
+	var mu sync.Mutex
+	completedAt := make(map[string]time.Time)
+
+	makeTask := func(name string, delay time.Duration) FuncCtx {
+		return func(ctx context.Context) error {
+			time.Sleep(delay)
+			mu.Lock()
+			completedAt[name] = time.Now()
+			mu.Unlock()
+			return nil
+		}
+	}
+
+	// Priority 0 wave: two tasks running concurrently — wave takes max(50ms, 150ms) = 150ms
+	sm.RegisterWithPriority("p0", 0,
+		makeTask("p0-fast", 50*time.Millisecond),
+		makeTask("p0-slow", 150*time.Millisecond),
+	)
+
+	// Priority 1 wave: starts only after p0 wave completes — takes 100ms
+	sm.RegisterWithPriority("p1", 1,
+		makeTask("p1-task", 100*time.Millisecond),
+	)
+
+	start := time.Now()
+	sm.executeShutdown()
+	totalDuration := time.Since(start)
+
+	// All tasks should have completed.
+	if len(completedAt) != 3 {
+		t.Fatalf("expected 3 completed tasks, got %d: %v", len(completedAt), completedAt)
+	}
+
+	// p0-fast and p0-slow ran concurrently — p0-slow finished ~150ms after start.
+	// p1-task started only after p0-slow finished — completed ~250ms after start.
+	// Total should be ~250ms (150ms p0 wave + 100ms p1 wave).
+	if totalDuration > 500*time.Millisecond {
+		t.Fatalf("total duration too long: %v (expected ~250ms)", totalDuration)
+	}
+
+	// Key correctness assertion: p1 must have started AFTER p0-slow completed.
+	// This is the wave guarantee — p1 task completion must be >= p0-slow completion + 100ms.
+	mu.Lock()
+	p0SlowDone := completedAt["p0-slow"]
+	p1Done := completedAt["p1-task"]
+	mu.Unlock()
+
+	if p1Done.Before(p0SlowDone) || p1Done.Equal(p0SlowDone) {
+		t.Fatalf("p1-task completed (%v) before or at same time as p0-slow (%v) — wave ordering not enforced",
+			p1Done.Format(time.RFC3339Nano), p0SlowDone.Format(time.RFC3339Nano))
+	}
+
+	// p1-task should complete approximately 100ms after p0-slow.
+	gap := p1Done.Sub(p0SlowDone)
+	if gap < 80*time.Millisecond {
+		t.Fatalf("p1-task completed too quickly after p0-slow (%v) — p1 may have started before p0 finished", gap)
+	}
+}
+
+// TestRegisterWithPriorityWavesAreSequential is the definitive ordering test.
+// It verifies that no task in wave N+1 begins before all tasks in wave N complete,
+// even with ShutdownConcurrent() enabled.
+func TestRegisterWithPriorityWavesAreSequential(t *testing.T) {
+	sm := NewShutdown(
+		ShutdownWithTimeout(2*time.Second),
+		ShutdownConcurrent(),
+	)
+
+	var mu sync.Mutex
+	var p0Running bool
+	p1StartedWhileP0Running := false
+
+	// p0 task: runs for 100ms
+	sm.RegisterWithPriority("p0", 0, func(ctx context.Context) error {
+		mu.Lock()
+		p0Running = true
+		mu.Unlock()
+
+		time.Sleep(100 * time.Millisecond)
+
+		mu.Lock()
+		p0Running = false
+		mu.Unlock()
+		return nil
+	})
+
+	// p1 task: checks whether p0 is still running when it starts
+	sm.RegisterWithPriority("p1", 1, func(ctx context.Context) error {
+		mu.Lock()
+		if p0Running {
+			p1StartedWhileP0Running = true
+		}
+		mu.Unlock()
+
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	})
+
+	sm.executeShutdown()
+
+	if p1StartedWhileP0Running {
+		t.Fatal("WAVE ORDERING VIOLATED: p1 task started while p0 task was still running — waves must be sequential")
+	}
+}
+
+// TestRegisterWithPriorityNegativePriority verifies negative priorities work.
+func TestRegisterWithPriorityNegativePriority(t *testing.T) {
+	sm := NewShutdown(ShutdownWithTimeout(100 * time.Millisecond))
+
+	var order []string
+	var mu sync.Mutex
+
+	_ = sm.RegisterWithPriority("neg", -1,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "negative")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	_ = sm.RegisterWithPriority("zero", 0,
+		func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "zero")
+			mu.Unlock()
+			return nil
+		},
+	)
+
+	sm.executeShutdown()
+
+	expected := []string{"negative", "zero"}
+	if len(order) != len(expected) {
+		t.Fatalf("expected %d items, got %d: %v", len(expected), len(order), order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Fatalf("position %d: expected %s, got %s", i, v, order[i])
+		}
+	}
+}
+
+// TestRegisterWithPrioritySingleFunction tests registering a single function per call.
+func TestRegisterWithPrioritySingleFunction(t *testing.T) {
+	sm := NewShutdown(ShutdownWithTimeout(100 * time.Millisecond))
+
+	var ran bool
+	_ = sm.RegisterWithPriority("single", 42,
+		func(ctx context.Context) error {
+			ran = true
+			return nil
+		},
+	)
+
+	stats := sm.executeShutdown()
+
+	if !ran {
+		t.Fatal("single function did not execute")
+	}
+	if stats.CompletedEvents != 1 {
+		t.Fatalf("expected 1 completed event, got %d", stats.CompletedEvents)
 	}
 }
 
