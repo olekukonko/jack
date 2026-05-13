@@ -1,4 +1,3 @@
-// shutdown.go
 package jack
 
 import (
