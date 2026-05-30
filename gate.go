@@ -3,100 +3,124 @@ package jack
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
-// Gate is a reusable barrier that can be opened, closed, or pulsed.
-// When open, all waiters pass; when closed, waiters block.
-// Pulse wakes current waiters but remains closed.
+// gateSignal wraps a channel with once-only close.
+type gateSignal struct {
+	ch        chan struct{}
+	closeOnce sync.Once
+}
+
+func (s *gateSignal) Close() {
+	if s != nil {
+		s.closeOnce.Do(func() { close(s.ch) })
+	}
+}
+
+// Gate is a reusable barrier. Open lets all waiters pass; Close blocks
+// future waiters. Pulse wakes current waiters but remains closed.
 type Gate struct {
-	mu      sync.Mutex
-	opened  bool
-	waiters []chan struct{}
+	opened   atomic.Bool
+	signal   atomic.Pointer[gateSignal]
+	pulseGen atomic.Uint64
+	once     sync.Once
+}
+
+func (g *Gate) init() {
+	g.once.Do(func() {
+		if g.signal.Load() == nil {
+			g.signal.Store(&gateSignal{ch: make(chan struct{})})
+		}
+	})
 }
 
 // Open allows all current and future waiters to proceed.
 func (g *Gate) Open() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.opened = true
-	for _, ch := range g.waiters {
-		close(ch)
+	g.opened.Store(true)
+	old := g.signal.Load()
+	if old != nil {
+		old.Close()
 	}
-	g.waiters = g.waiters[:0]
+	newSig := &gateSignal{ch: make(chan struct{})}
+	newSig.Close()
+	g.signal.Store(newSig)
 }
 
 // Close prevents future waiters from proceeding.
 func (g *Gate) Close() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.opened = false
+	g.opened.Store(false)
+	g.signal.Store(&gateSignal{ch: make(chan struct{})})
 }
 
 // Pulse wakes all current waiters; the gate remains closed.
 func (g *Gate) Pulse() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	waiters := g.waiters
-	g.waiters = g.waiters[:0]
-	for _, ch := range waiters {
-		close(ch)
-	}
+	g.pulseGen.Add(1)
+	newSig := &gateSignal{ch: make(chan struct{})}
+	old := g.signal.Swap(newSig)
+	g.opened.Store(false)
+	old.Close()
 }
 
-// Wait blocks until the gate is opened.
+// Wait blocks until the gate is opened or pulsed.
 func (g *Gate) Wait() {
-	g.mu.Lock()
-	if g.opened {
-		g.mu.Unlock()
-		return
+	g.init()
+	startGen := g.pulseGen.Load()
+	for {
+		if g.opened.Load() {
+			return
+		}
+		sig := g.signal.Load()
+		if sig == nil {
+			if g.opened.Load() {
+				return
+			}
+			continue
+		}
+		<-sig.ch
+		if g.pulseGen.Load() != startGen {
+			return
+		}
 	}
-	ch := make(chan struct{})
-	g.waiters = append(g.waiters, ch)
-	g.mu.Unlock()
-	<-ch
 }
 
 // TryWait returns true if the gate is currently open.
 func (g *Gate) TryWait() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.opened
+	return g.opened.Load()
 }
 
-// WaitCtx blocks until the gate is opened or the context is cancelled.
+// WaitCtx blocks until the gate is opened, pulsed, or ctx is cancelled.
 func (g *Gate) WaitCtx(ctx context.Context) error {
-	g.mu.Lock()
-	if g.opened {
-		g.mu.Unlock()
-		return nil
-	}
-	ch := make(chan struct{})
-	g.waiters = append(g.waiters, ch)
-	g.mu.Unlock()
-
-	select {
-	case <-ctx.Done():
-		g.removeWaiter(ch)
-		return ctx.Err()
-	case <-ch:
-		return nil
-	}
-}
-
-func (g *Gate) removeWaiter(ch chan struct{}) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for i, w := range g.waiters {
-		if w == ch {
-			g.waiters = append(g.waiters[:i], g.waiters[i+1:]...)
-			return
+	g.init()
+	startGen := g.pulseGen.Load()
+	for {
+		if g.opened.Load() {
+			return nil
+		}
+		sig := g.signal.Load()
+		if sig == nil {
+			if g.opened.Load() {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-sig.ch:
+			if g.pulseGen.Load() != startGen {
+				return nil
+			}
 		}
 	}
 }
 
 // IsOpen reports whether the gate is currently open.
 func (g *Gate) IsOpen() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.opened
+	return g.opened.Load()
 }

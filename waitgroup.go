@@ -1,9 +1,9 @@
+// waitgroup.go
 package jack
 
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 )
 
 // WaitGroup is a reusable goroutine coordinator. Unlike sync.WaitGroup,
@@ -11,34 +11,34 @@ import (
 type WaitGroup struct {
 	mu      sync.Mutex
 	count   int
-	waiters []chan struct{}
-	closed  atomic.Bool
+	signal  chan struct{}
+	started bool
 }
 
 // Add adds n to the wait group count.
 func (wg *WaitGroup) Add(n int) {
 	wg.mu.Lock()
 	wg.count += n
-	wg.closed.Store(false)
+	if wg.count < 0 {
+		wg.mu.Unlock()
+		panic("jack.WaitGroup: negative count")
+	}
+	if n > 0 {
+		wg.started = true
+	}
+	if wg.count > 0 && wg.signal == nil {
+		wg.signal = make(chan struct{})
+	}
+	if wg.count == 0 && wg.signal != nil {
+		close(wg.signal)
+		wg.signal = nil
+	}
 	wg.mu.Unlock()
 }
 
 // Done decrements the wait group count.
 func (wg *WaitGroup) Done() {
-	wg.mu.Lock()
-	wg.count--
-	if wg.count < 0 {
-		wg.mu.Unlock()
-		panic("jack.WaitGroup: negative count")
-	}
-	if wg.count == 0 {
-		wg.closed.Store(true)
-		for _, ch := range wg.waiters {
-			close(ch)
-		}
-		wg.waiters = wg.waiters[:0]
-	}
-	wg.mu.Unlock()
+	wg.Add(-1)
 }
 
 // Go starts fn in a new goroutine and tracks its completion.
@@ -57,8 +57,7 @@ func (wg *WaitGroup) Wait() {
 		wg.mu.Unlock()
 		return
 	}
-	ch := make(chan struct{})
-	wg.waiters = append(wg.waiters, ch)
+	ch := wg.signal
 	wg.mu.Unlock()
 	<-ch
 }
@@ -77,15 +76,14 @@ func (wg *WaitGroup) Waiters() int {
 	return wg.count
 }
 
-// WaitCtx blocks until all tracked goroutines complete or the context is cancelled.
+// WaitCtx blocks until all tracked goroutines complete or ctx is cancelled.
 func (wg *WaitGroup) WaitCtx(ctx context.Context) error {
 	wg.mu.Lock()
 	if wg.count == 0 {
 		wg.mu.Unlock()
 		return nil
 	}
-	ch := make(chan struct{})
-	wg.waiters = append(wg.waiters, ch)
+	ch := wg.signal
 	wg.mu.Unlock()
 
 	select {
@@ -97,6 +95,9 @@ func (wg *WaitGroup) WaitCtx(ctx context.Context) error {
 }
 
 // IsDone reports whether all tracked goroutines have completed.
+// Returns false for a zero-value WaitGroup that has never been used.
 func (wg *WaitGroup) IsDone() bool {
-	return wg.closed.Load()
+	wg.mu.Lock()
+	defer wg.mu.Unlock()
+	return wg.started && wg.count == 0
 }

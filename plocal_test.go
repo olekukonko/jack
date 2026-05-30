@@ -51,7 +51,7 @@ func TestPLocal_Concurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if p.Get() < 1 {
+	if p.Fold(0, func(a, b int) int { return a + b }) < 1 {
 		t.Fatal("expected positive value")
 	}
 }

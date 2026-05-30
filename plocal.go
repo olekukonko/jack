@@ -1,32 +1,37 @@
 package jack
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 )
 
 const plocalShards = 128
 
-var plocalIndexCounter atomic.Uint64
+var plocalRoundRobin atomic.Uint64
 
-var plocalSlotPool = sync.Pool{
-	New: func() any {
-		return &plocalSlot{
-			idx: uint(plocalIndexCounter.Add(1) % uint64(plocalShards)),
-		}
-	},
+// plocalIndexFast returns a round-robin shard index for counters.
+// Zero-allocation, zero-contention distribution across shards.
+func plocalIndexFast() uint {
+	return uint(plocalRoundRobin.Add(1) % uint64(plocalShards))
 }
 
-type plocalSlot struct {
-	idx uint
+// getGoroutineID extracts the goroutine ID from the runtime stack trace.
+// Used for stable shard affinity in PLocal[T].
+func getGoroutineID() uint64 {
+	var b [64]byte
+	n := runtime.Stack(b[:], false)
+	var id uint64
+	// Skip "goroutine " prefix (10 bytes)
+	for i := 10; i < n && b[i] >= '0' && b[i] <= '9'; i++ {
+		id = id*10 + uint64(b[i]-'0')
+	}
+	return id
 }
 
 // plocalIndex returns a stable shard index for the current goroutine.
-// It uses sync.Pool to leverage the per-P cache, giving high affinity.
 func plocalIndex() uint {
-	slot := plocalSlotPool.Get().(*plocalSlot)
-	defer plocalSlotPool.Put(slot)
-	return slot.idx
+	return uint(getGoroutineID() % uint64(plocalShards))
 }
 
 // PLocalCounter is a high-throughput counter sharded across multiple
@@ -37,7 +42,7 @@ type PLocalCounter struct {
 
 // Add adds n to the counter.
 func (c *PLocalCounter) Add(n int64) {
-	c.shards[plocalIndex()].Add(n)
+	c.shards[plocalIndexFast()].Add(n)
 }
 
 // Value returns the current sum across all shards.
@@ -86,4 +91,18 @@ func (p *PLocal[T]) Set(v T) {
 	s.mu.Lock()
 	s.val = v
 	s.mu.Unlock()
+}
+
+// Fold aggregates values across all shards using the provided function.
+// The accumulator is initialized to zeroValue and fn is called for each shard.
+// Useful for summing counters or collecting metrics from all goroutines.
+func (p *PLocal[T]) Fold(zeroValue T, fn func(acc, val T) T) T {
+	acc := zeroValue
+	for i := range p.shards {
+		s := &p.shards[i]
+		s.mu.Lock()
+		acc = fn(acc, s.val)
+		s.mu.Unlock()
+	}
+	return acc
 }
