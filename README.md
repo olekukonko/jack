@@ -16,7 +16,7 @@ Go's concurrency primitives are excellent, but production systems need more:
 - Health checks that degrade and accelerate automatically
 - Observability into what every component is actually doing
 
-Jack fills these gaps without getting in your way. Every component exposes a `Metrics()` method with atomic counters safe for concurrent reads.
+Jack fills these gaps without getting in your way. Components that manage resources or handle traffic expose a `Metrics()` method with atomic counters safe for concurrent reads.
 
 ---
 
@@ -47,7 +47,6 @@ sem := jack.NewSemaphore(10,
 )
 defer sem.Close()
 
-// Atomic bulk acquire — either all n slots or none.
 if sem.TryAcquireN(jack.PriorityHigh, 3) {
     defer func() {
         sem.Release()
@@ -56,7 +55,6 @@ if sem.TryAcquireN(jack.PriorityHigh, 3) {
     }()
 }
 
-// Blocking acquire respects priority: Critical served before High, etc.
 if err := sem.Acquire(ctx, jack.PriorityCritical); err != nil {
     return err
 }
@@ -64,18 +62,16 @@ defer sem.Release()
 ```
 
 ### RateLimiter
-Token bucket with priority queueing. `Allow`/`AllowN` are lock-free. `Acquire` blocks with context. `Reserve` returns a non-blocking `Reservation` the caller can inspect and cancel without blocking any goroutine — ideal for admission control.
+Token bucket with priority queueing. `Allow`/`AllowN` are lock-free. `Acquire` blocks with context. `Reserve` returns a non-blocking `Reservation` the caller can inspect and cancel without blocking any goroutine.
 
 ```go
-rl := jack.NewRateLimiter(1000, 100) // 1000 req/s, burst 100
+rl := jack.NewRateLimiter(1000, 100)
 defer rl.Close()
 
-// Non-blocking fast path.
 if rl.Allow(jack.PriorityHigh) {
     // proceed
 }
 
-// Non-blocking reservation — inspect delay, then decide.
 res := rl.Reserve(1, jack.ReserveWithMaxDelay(50*time.Millisecond))
 if !res.OK() {
     return ErrTooManyRequests
@@ -84,16 +80,14 @@ if err := res.Wait(ctx); err != nil {
     res.Cancel()
     return err
 }
-// tokens consumed — proceed
 
-// Blocking acquire with priority.
 if err := rl.Acquire(ctx, jack.PriorityHigh); err != nil {
     return err
 }
 ```
 
 ### Throttle
-Client-side self-tuning throttle. Observes upstream acceptance and rejection rates, probabilistically dropping local requests before sending when the upstream is overloaded. Each priority tier has an independent probability — Critical is shed last, Low is shed first. Per-tier live probability via `Probability(p)` and `Metrics().ThrottleProbs`.
+Client-side self-tuning throttle. Observes upstream acceptance and rejection rates, probabilistically dropping local requests before sending when the upstream is overloaded.
 
 ```go
 throttle := jack.NewThrottle(jack.priorityCount,
@@ -102,24 +96,19 @@ throttle := jack.NewThrottle(jack.priorityCount,
 )
 defer throttle.Close()
 
-// Record upstream outcomes.
 if upstreamErr != nil {
     throttle.Rejected(jack.PriorityHigh)
 } else {
     throttle.Accepted(jack.PriorityHigh)
 }
 
-// Check before sending.
 if !throttle.Allow(jack.PriorityHigh) {
     return ErrThrottled
 }
-
-fmt.Printf("critical rejection prob: %.2f%%\n",
-    throttle.Probability(jack.PriorityCritical)*100)
 ```
 
 ### Circuit Breaker
-Three-state machine (Closed → Open → HalfOpen). All state transitions are lock-free atomic CAS. `Call` is the only entry point — it wraps your function and manages the state machine around it. `onStateChange` callback for alerting and metrics.
+Three-state machine (Closed → Open → HalfOpen). All state transitions are lock-free atomic CAS.
 
 ```go
 breaker := jack.NewBreaker("payments-api",
@@ -140,7 +129,7 @@ if errors.Is(err, jack.ErrBreakerOpen) {
 ```
 
 ### Bulkhead
-Isolates failure domains by giving each named partition its own bounded concurrency budget backed by an independent Semaphore. When one partition saturates, others are completely unaffected. Partitions auto-create on first use.
+Isolates failure domains by giving each named partition its own bounded concurrency budget backed by an independent Semaphore.
 
 ```go
 bh := jack.NewBulkhead(
@@ -153,15 +142,10 @@ defer bh.Close()
 err := bh.Call(ctx, "payments", jack.PriorityHigh, func(ctx context.Context) error {
     return db.Query(ctx, ...)
 })
-if errors.Is(err, jack.ErrBulkheadFull) {
-    return ErrServiceBusy
-}
-
-fmt.Println(bh.Available("payments"), bh.Metrics("payments").AcquiredFast.Load())
 ```
 
 ### Adaptive Concurrency Limiter
-AIMD gradient controller that adjusts its concurrency limit dynamically based on observed RTT. Below target RTT → additive increase. Above target → multiplicative decrease. Bounds enforced at `minLimit`/`maxLimit`. Mirrors Netflix/concurrency-limits and Envoy's adaptive concurrency filter.
+AIMD gradient controller that adjusts its concurrency limit dynamically based on observed RTT.
 
 ```go
 limiter := jack.NewAdaptiveLimiter(
@@ -175,57 +159,42 @@ defer limiter.Close()
 err := limiter.Call(ctx, jack.PriorityHigh, func(ctx context.Context) error {
     return upstream.Call(ctx, req)
 })
-
-m := limiter.Metrics()
-fmt.Println(m.CurrentLimit.Load(), m.AvgRTTNs.Load())
 ```
 
 ### Retry
-Exponential backoff with full jitter, configurable predicate, and per-call metrics. `Retry` is reusable and safe for concurrent use. Supports permanent-error detection to skip retry on non-retryable failures.
+Exponential backoff with full jitter, configurable predicate, and per-call metrics.
 
 ```go
 policy := jack.NewRetry(
     jack.RetryWithMaxAttempts(5),
     jack.RetryWithBaseDelay(100*time.Millisecond),
-    jack.RetryWithMaxDelay(30*time.Second),
-    jack.RetryWithJitter(true),
     jack.RetryWithRetryIf(func(err error) bool {
         return !errors.Is(err, ErrPermanent)
-    }),
-    jack.RetryWithOnRetry(func(attempt int, err error) {
-        log.Printf("retry %d: %v", attempt, err)
     }),
 )
 
 err := policy.Do(ctx, func(ctx context.Context) error {
     return upstream.Call(ctx, req)
 })
-if errors.Is(err, jack.ErrRetryExhausted) {
-    return ErrMaxRetriesExceeded
-}
 ```
 
 ### Hedged Requests
-Fire a duplicate request after a configurable delay. Whichever responds first is returned; the other is cancelled. The hedge delay adapts automatically from a lock-free circular RTT sample buffer — no external dependencies. Safe only for idempotent operations. Typed `HedgerOf[T]` wrapper avoids casts.
+Fire a duplicate request after a configurable delay. Whichever responds first is returned; the other is cancelled. Adaptive delay from RTT samples.
 
 ```go
-// Typed — no casts at the call site.
 hedger := jack.NewHedgerOf[*UserResponse](
-    jack.HedgeWithPercentile(95),   // fire hedge at p95 latency
-    jack.HedgeWithMinSamples(20),   // warm-up period before adaptive delay
+    jack.HedgeWithPercentile(95),
+    jack.HedgeWithMinSamples(20),
     jack.HedgeWithMaxConcurrent(50),
 )
 
 user, err := hedger.Do(ctx, func(ctx context.Context) (*UserResponse, error) {
     return userClient.Get(ctx, id)
 })
-
-m := hedger.Metrics()
-fmt.Println(m.Hedged.Load(), m.HedgeWon.Load(), m.PrimaryWon.Load())
 ```
 
 ### Lease
-A time-bounded semaphore slot with automatic reclamation. If the holder crashes or forgets to call `Release`, the internal `Reaper` reclaims the slot automatically after TTL — slots are never permanently lost.
+A time-bounded semaphore slot with automatic reclamation via the Reaper.
 
 ```go
 sem := jack.NewSemaphore(20)
@@ -237,12 +206,10 @@ if err != nil {
     return err
 }
 defer lease.Release()
-
-// If this process crashes, the slot is returned after 30s automatically.
 ```
 
 ### Queue
-Bounded, multi-priority, multi-consumer work queue. Per-priority bins with tail-drop under saturation. Item timeout eviction. `EnqueueCtx` blocks until space is available. The natural entry point for a load-balancer pipeline before applying `Semaphore` or `RateLimiter` downstream.
+Bounded, multi-priority, multi-consumer work queue. Per-priority bins with tail-drop under saturation.
 
 ```go
 q := jack.NewQueue(func(ctx context.Context, item any) error {
@@ -257,14 +224,10 @@ defer q.Close()
 if err := q.Enqueue(jack.PriorityCritical, req); err == jack.ErrQueueFull {
     return ErrBackpressure
 }
-
-depths := q.DepthByPriority()
-fmt.Printf("critical=%d high=%d medium=%d low=%d\n",
-    depths[0], depths[1], depths[2], depths[3])
 ```
 
 ### Routines
-Goroutine tracker and lifecycle manager. Every `Go` call registers the goroutine with an ID, tracks its state (Running/Done/Panicked/Cancelled), captures panic stacks, and guarantees it is joined by `Stop` or `Wait`. The `DefaultRoutines` singleton lets you use it without passing the tracker around.
+Goroutine tracker and lifecycle manager. Every spawned goroutine is registered, tracked by state, captures panic stacks, and is guaranteed joined by `Stop` or `Wait`.
 
 ```go
 rt := jack.NewRoutines(
@@ -272,24 +235,18 @@ rt := jack.NewRoutines(
         log.Printf("panic in %s: %v\n%s", info.ID, info.Err, info.Stack)
     }),
 )
-defer rt.Stop() // cancels all goroutines and waits
+defer rt.Stop()
 
 rt.Spawn("fetch-users", func(ctx context.Context) error {
     return fetchUsers(ctx)
 })
 
 rt.Background("heartbeat", 0, func(ctx context.Context) error {
-    return sendHeartbeat(ctx) // restarts on error, unlimited times
+    return sendHeartbeat(ctx)
 })
 
-// Inspect state of any goroutine.
 info, ok := rt.Info("fetch-users#1")
 fmt.Println(info.State, info.StartedAt)
-
-// Or use the package-level singleton.
-jack.Spawn("background-job", func(ctx context.Context) error {
-    return runJob(ctx)
-})
 ```
 
 ### Future/Promise
@@ -300,7 +257,7 @@ f := jack.Async(func() (string, error) {
     return fetchUser()
 })
 
-f.Then(ctx, func(user string) (any, error) {
+result, err := f.Then(ctx, func(user string) (any, error) {
     return fetchProfile(user)
 }).Await()
 ```
@@ -347,7 +304,7 @@ looper.Start()
 ```
 
 ### Shutdown
-Graceful termination with signal handling. Register cleanup in LIFO order. Named tasks appear correctly in stats and logs. Supports concurrent execution of cleanup handlers.
+Graceful termination with signal handling. Register cleanup in LIFO order.
 
 ```go
 sd := jack.NewShutdown(
@@ -357,7 +314,7 @@ sd := jack.NewShutdown(
 sd.RegisterCloser("db", db)
 sd.RegisterFunc("cache", cache.Flush)
 sd.RegisterWithContext("grpc", grpcServer.GracefulStop)
-sd.Wait() // blocks until SIGTERM/SIGINT
+sd.Wait()
 ```
 
 ### Reaper
@@ -383,18 +340,127 @@ lm.ScheduleTimed(ctx, "heartbeat", func(ctx context.Context, id string) {
 lm.ResetTimed("heartbeat")
 ```
 
-### Runner, Scheduler, Group
-Single-worker queue, cron-style scheduling, and coordinated goroutine groups with error collection.
+### PLocal — Goroutine-Sharded Storage
+Eliminates cache-line contention by giving each goroutine its own shard. `Get`/`Set`/`With` access only the current goroutine's slot with zero cross-goroutine contention. Use `Fold` to aggregate across all shards when needed.
 
-### Safely
-Context-aware mutex with panic recovery.
+```go
+// High-throughput counter without atomic contention.
+var counter jack.PLocalCounter
+counter.Add(1)
+total := counter.Value()
+
+// Generic sharded storage.
+var storage jack.PLocal[map[string]int]
+storage.With(func(m *map[string]int) {
+    (*m)["key"] = 42
+})
+
+// Aggregate across all shards.
+sum := storage.Fold(0, func(acc, val int) int { return acc + val })
+```
+
+### Flight — Request Coalescing
+Deduplicate concurrent executions by key. The first caller becomes the leader and runs `fn` directly; waiters block until the leader finishes and receive the same result. Panics are recovered and returned as `*CaughtPanic` to all waiters.
+
+```go
+flight := jack.NewFlight()
+
+res, err := flight.Do("user:123", func() (interface{}, error) {
+    return fetchUser(123)
+})
+// Concurrent callers with the same key receive the same result without re-executing.
+```
+
+### OnceGroup — Generic Singleflight
+Coalesce in-flight duplicate requests for the same key with typed results. The first call executes `fn`; subsequent calls wait and share the result. Context cancellation affects only the waiter.
+
+```go
+var g jack.OnceGroup[string, *User]
+
+user, err, shared := g.Do(ctx, "user-123", func() (*User, error) {
+    return fetchUser("user-123")
+})
+```
+
+### Gate — Reusable Barrier
+Open lets all current and future waiters pass. Close blocks future waiters. Pulse wakes current waiters but remains closed.
+
+```go
+var g jack.Gate
+g.Close()
+
+go func() {
+    g.Wait() // blocks
+}()
+
+g.Open() // all waiters proceed
+```
+
+### Latch — One-Shot Signal
+Starts closed; once `Open()` is called, remains open forever.
+
+```go
+var l jack.Latch
+go func() {
+    l.Wait() // blocks until Open()
+}()
+l.Open()
+```
+
+### Coalescer — Batch Flushing
+Merge discrete items into batches and flush them together. Useful for write coalescing, metrics aggregation, or event batching.
+
+```go
+c := jack.NewCoalescer(func(items []interface{}) error {
+    return batchWrite(items)
+}, 100, 5*time.Second)
+
+c.Add(event1)
+c.Add(event2) // flushes when batch reaches 100 or timer fires
+```
+
+### Observable / Observer
+Type-safe pub/sub with worker pool for async notification delivery. Panic recovery in observers prevents worker crashes.
+
+```go
+obs := jack.NewObservable[jack.Event](5)
+obs.Add(myObserver)
+obs.Notify(event1, event2)
+obs.Shutdown()
+```
+
+### Safely — Context-Aware Mutex
+Lock with panic recovery and context cancellation support.
 
 ```go
 var mu jack.Safely
 err := mu.SafeCtx(ctx, func() error {
-    return nil
+    return criticalSection()
 })
 ```
+
+### Helpers
+Convenience functions for common patterns.
+
+```go
+// Wait for fn with context cancellation.
+err := jack.Wait(ctx, fn)
+
+// Run fn with timeout.
+err := jack.WaitTimeout(5*time.Second, fn)
+
+// Run fn and return its error or context cancellation.
+err := jack.Execute(ctx, fn)
+
+// Repeat fn at interval until context cancelled.
+err := jack.Repeat(ctx, interval, fn)
+
+// Run fn for i in [0,n) concurrently, fail-fast on first error.
+err := jack.Parallel(ctx, n, fn)
+```
+
+### Runner, Scheduler, Group
+Single-worker queue, cron-style scheduling, and coordinated goroutine groups with error collection.
 
 ---
 
@@ -413,14 +479,13 @@ All backpressure components share a four-level priority system. Lower numeric va
 
 ## Observability
 
-Every component exposes a `Metrics()` method with atomic counters safe for concurrent reads without locks.
+Components that manage resources or handle traffic expose a `Metrics()` method with atomic counters safe for concurrent reads without locks.
 
 ```go
 obs := jack.NewObservable[jack.Event](10)
 obs.Add(myObserver)
 pool := jack.NewPool(5, jack.PoolingWithObservable(obs))
 
-// Scrape metrics from any component:
 sem.Metrics().QueueDepth.Load()
 rl.Metrics().TokensConsumed.Load()
 breaker.Metrics().StateChanges.Load()
@@ -464,7 +529,12 @@ if cp, ok := err.(*jack.CaughtPanic); ok {
 | Prioritised async work queue | `Queue` |
 | Track and terminate all goroutines | `Routines` |
 | Bound concurrent access with priorities | `Semaphore` |
-| Rate-limit bursty calls | `Debouncer` |
+| Eliminate cache-line contention on counters | `PLocal` / `PLocalCounter` |
+| Deduplicate concurrent identical requests | `Flight` / `OnceGroup` |
+| Signal/wait between goroutines | `Gate` / `Latch` |
+| Batch items for efficient flushing | `Coalescer` |
+| Publish events to multiple observers | `Observable` |
+| Rate-limit rapid calls | `Debouncer` |
 | Background loop with backoff | `Looper` |
 | Graceful shutdown with cleanup ordering | `Shutdown` |
 | Expire items after TTL | `Reaper` |
@@ -477,8 +547,6 @@ if cp, ok := err.(*jack.CaughtPanic); ok {
 ---
 
 ## Composing Components
-
-The components are designed to stack. A typical high-volume service endpoint:
 
 ```
 Request
@@ -493,8 +561,6 @@ Request
   → Upstream
 ```
 
-Each layer is independent. Use only what your service needs.
-
 ---
 
 ## Testing
@@ -504,7 +570,7 @@ go test -v -race ./...
 go test -bench=. -benchmem -cpu=8 -run='^$' ./...
 ```
 
-Race detector is your friend. Jack is race-free by design. Every public API has benchmarks with `ReportAllocs()` — zero allocations on all fast paths.
+Race detector is your friend. Jack is race-free by design.
 
 ---
 
