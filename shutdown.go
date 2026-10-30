@@ -412,7 +412,12 @@ func (sm *Shutdown) executeShutdown() *ShutdownStats {
 	sm.stats.EndTime = time.Now()
 	sm.statsMu.Unlock()
 
-	sm.log("shutdown completed in %v (failed: %d)", sm.stats.EndTime.Sub(sm.stats.StartTime), sm.stats.FailedEvents)
+	sm.statsMu.Lock()
+	elapsed := sm.stats.EndTime.Sub(sm.stats.StartTime)
+	failed := sm.stats.FailedEvents
+	sm.statsMu.Unlock()
+
+	sm.log("shutdown completed in %v (failed: %d)", elapsed, failed)
 	sm.cancelFunc()
 	close(sm.doneChan)
 	signal.Stop(sm.signalChan)
