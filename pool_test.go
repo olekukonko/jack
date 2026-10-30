@@ -755,3 +755,209 @@ func TestPoolMetricsRejected(t *testing.T) {
 		t.Fatal("expected some rejected tasks when queue is full")
 	}
 }
+
+// TestPoolTaskIDStableAcrossEvents guards against ID regeneration: the submitter
+// (queued) and the worker (run/done) must observe the same task identifier.
+func TestPoolTaskIDStableAcrossEvents(t *testing.T) {
+	collector := newEventCollector()
+	obs := NewObservable[Event](1)
+	defer obs.Shutdown()
+	obs.Add(collector)
+
+	p := NewPool(1, PoolingWithObservable(obs))
+	if err := p.Submit(Func(func() error { return nil })); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := p.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		return len(collector.findEvents("", "done")) == 1
+	}, "expected a done event")
+
+	queued := collector.findEvents("", "queued")
+	run := collector.findEvents("", "run")
+	done := collector.findEvents("", "done")
+	if len(queued) != 1 || len(run) != 1 || len(done) != 1 {
+		t.Fatalf("expected one queued/run/done event, got %d/%d/%d", len(queued), len(run), len(done))
+	}
+	if queued[0].TaskID == "" {
+		t.Fatal("expected a generated task ID")
+	}
+	if queued[0].TaskID != run[0].TaskID || run[0].TaskID != done[0].TaskID {
+		t.Fatalf("task IDs differ across events: queued=%q run=%q done=%q",
+			queued[0].TaskID, run[0].TaskID, done[0].TaskID)
+	}
+}
+
+func TestPoolSubmitAfterShutdown(t *testing.T) {
+	p := NewPool(1)
+	if err := p.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if !p.IsClosed() {
+		t.Fatal("expected IsClosed after Shutdown")
+	}
+	if err := p.Submit(Func(func() error { return nil })); !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("expected ErrPoolClosed from Submit, got %v", err)
+	}
+	if err := p.SubmitCtx(context.Background(), FuncCtx(func(context.Context) error { return nil })); !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("expected ErrPoolClosed from SubmitCtx, got %v", err)
+	}
+}
+
+// TestPoolSubmitSynchronizesWithChannelClose pins down the invariant that makes
+// Submit panic-free: a sender must take sendMu for reading, so it cannot reach
+// the channel send while Shutdown holds the write lock on the way to close.
+func TestPoolSubmitSynchronizesWithChannelClose(t *testing.T) {
+	p := NewPool(1, PoolingWithQueueSize(1))
+
+	// Simulate Shutdown having taken the write lock (between marking the pool
+	// closed and closing the task channel).
+	p.sendMu.Lock()
+
+	submitted := make(chan error, 1)
+	go func() {
+		submitted <- p.Submit(Func(func() error { return nil }))
+	}()
+
+	select {
+	case err := <-submitted:
+		p.sendMu.Unlock()
+		t.Fatalf("Submit bypassed sendMu (err=%v): it can race close(tasks) and panic", err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: the sender is blocked on the lock held by the closer.
+	}
+
+	p.sendMu.Unlock()
+
+	select {
+	case err := <-submitted:
+		if err != nil {
+			t.Fatalf("submit after lock release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Submit did not complete after the lock was released")
+	}
+
+	if err := p.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+}
+
+func TestPoolSubmitConcurrentWithShutdown(t *testing.T) {
+	for attempt := 0; attempt < 100; attempt++ {
+		p := NewPool(1, PoolingWithQueueSize(1))
+
+		var panics atomic.Int64
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						panics.Add(1)
+					}
+				}()
+				<-start
+				for j := 0; j < 50; j++ {
+					_ = p.Submit(Func(func() error { return nil }))
+				}
+			}()
+		}
+
+		close(start)
+		_ = p.Shutdown(100 * time.Millisecond)
+		wg.Wait()
+
+		if n := panics.Load(); n > 0 {
+			t.Fatalf("Submit panicked %d times while racing Shutdown (attempt %d)", n, attempt)
+		}
+	}
+}
+
+// TestPoolQueueDepthMetric checks the depth gauge stays consistent: every
+// enqueue is matched by exactly one worker dequeue.
+func TestPoolQueueDepthMetric(t *testing.T) {
+	const tasks = 8
+	p := NewPool(2, PoolingWithQueueSize(tasks))
+	for i := 0; i < tasks; i++ {
+		if err := p.Submit(Func(func() error { return nil })); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+	}
+	if err := p.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	m := p.Metrics()
+	if got := m.TasksSubmitted.Load(); got != tasks {
+		t.Fatalf("expected %d submitted, got %d", tasks, got)
+	}
+	if got := m.QueueDepth.Load(); got != 0 {
+		t.Fatalf("expected queue depth to drain to 0, got %d", got)
+	}
+	if got := m.MaxQueueDepth.Load(); got < 1 {
+		t.Fatalf("expected MaxQueueDepth >= 1, got %d", got)
+	}
+	if got := m.ActiveWorkers.Load(); got != 0 {
+		t.Fatalf("expected no active workers after shutdown, got %d", got)
+	}
+}
+
+// TestPoolDoHelpers covers the fire-and-forget helpers and QueueSize.
+func TestPoolDoHelpers(t *testing.T) {
+	p := NewPool(1)
+	var ran atomic.Int32
+
+	p.Do(func() { ran.Add(1) })
+	p.DoCtx(context.Background(), func(context.Context) { ran.Add(1) })
+
+	waitForCondition(t, time.Second, func() bool { return ran.Load() == 2 },
+		"Pool.Do/Pool.DoCtx did not execute the functions")
+
+	if qs := p.QueueSize(); qs < 0 {
+		t.Fatalf("queue size must not be negative, got %d", qs)
+	}
+	if err := p.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if qs := p.QueueSize(); qs != 0 {
+		t.Fatalf("expected empty queue after shutdown, got %d", qs)
+	}
+}
+
+// TestPoolNoIDSkipsGeneration covers PoolingWithNoID: events carry an empty ID
+// and no ULID is generated for the task.
+func TestPoolNoIDSkipsGeneration(t *testing.T) {
+	collector := newEventCollector()
+	obs := NewObservable[Event](1)
+	defer obs.Shutdown()
+	obs.Add(collector)
+
+	p := NewPool(1, PoolingWithObservable(obs), PoolingWithNoID())
+	if err := p.Submit(Func(func() error { return nil })); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := p.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		return len(collector.findEvents("", "done")) == 1
+	}, "expected a done event")
+
+	for _, typ := range []string{"queued", "run", "done"} {
+		evts := collector.findEvents("", typ)
+		if len(evts) != 1 {
+			t.Fatalf("expected one %q event, got %d", typ, len(evts))
+		}
+		if evts[0].TaskID != "" {
+			t.Fatalf("expected empty task ID for %q event, got %q", typ, evts[0].TaskID)
+		}
+	}
+}

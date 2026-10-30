@@ -38,8 +38,11 @@ type Pool struct {
 
 	closed atomic.Bool
 
-	// sendMu protects the channel close operation only.
-	// Writers hold RLock; Shutdown acquires Lock before close(tasks).
+	// sendMu guards the task channel against being closed while a submit is in
+	// flight. Every sender holds RLock across its send; Shutdown acquires Lock
+	// before close(tasks). Without this on the non-blocking path, a Submit that
+	// passed the closed check just before Shutdown would panic with
+	// "send on closed channel".
 	sendMu sync.RWMutex
 
 	logger *ll.Logger
@@ -143,10 +146,23 @@ func (p *Pool) DoCtx(ctx context.Context, fn func(ctx context.Context)) {
 
 // tryEnqueue attempts to send a job to the pool's task channel.
 // Returns (sent, poolClosed).
+//
+// The read lock is held across the send so Shutdown cannot close the channel
+// between the closed check and the send. Both the blocking and non-blocking
+// paths need this: sending on a closed channel panics even inside a select with
+// a default branch.
 func (p *Pool) tryEnqueue(j job, ctx context.Context, nonBlocking bool) (sent, poolClosed bool) {
 	if p.closed.Load() {
 		return false, true
 	}
+
+	p.sendMu.RLock()
+	defer p.sendMu.RUnlock()
+
+	if p.closed.Load() {
+		return false, true
+	}
+
 	if nonBlocking {
 		select {
 		case p.tasks <- j:
@@ -158,14 +174,7 @@ func (p *Pool) tryEnqueue(j job, ctx context.Context, nonBlocking bool) (sent, p
 			return false, false
 		}
 	}
-	if p.closed.Load() {
-		return false, true
-	}
-	p.sendMu.RLock()
-	defer p.sendMu.RUnlock()
-	if p.closed.Load() {
-		return false, true
-	}
+
 	select {
 	case p.tasks <- j:
 		return true, false
@@ -174,10 +183,12 @@ func (p *Pool) tryEnqueue(j job, ctx context.Context, nonBlocking bool) (sent, p
 	}
 }
 
-// recordEnqueue stores the current queue depth and updates the high-water mark.
-func (p *Pool) recordEnqueue(depth int) {
-	d := int64(depth)
-	p.metrics.QueueDepth.Store(d)
+// recordEnqueue accounts for one task entering the queue and updates the
+// high-water mark. Queue depth is maintained with Add/Add(-1) by producers and
+// workers alike so the gauge stays consistent; it must never be overwritten
+// with len(p.tasks), which races with dequeues.
+func (p *Pool) recordEnqueue() {
+	d := p.metrics.QueueDepth.Add(1)
 	for {
 		cur := p.metrics.MaxQueueDepth.Load()
 		if d <= cur {
@@ -219,7 +230,7 @@ func (p *Pool) Submit(ts ...Task) error {
 			return ErrQueueFull
 		}
 		p.metrics.TasksSubmitted.Add(1)
-		p.recordEnqueue(len(p.tasks))
+		p.recordEnqueue()
 		p.logger.Debug("Pool.Submit: enqueued task %s", taskID)
 	}
 	return nil
@@ -260,7 +271,7 @@ func (p *Pool) SubmitCtx(ctx context.Context, ts ...TaskCtx) error {
 			return ctx.Err()
 		}
 		p.metrics.TasksSubmitted.Add(1)
-		p.recordEnqueue(len(p.tasks))
+		p.recordEnqueue()
 		p.logger.Debug("Pool.SubmitCtx: enqueued task %s", taskID)
 	}
 	return nil
