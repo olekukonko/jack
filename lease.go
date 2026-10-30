@@ -28,7 +28,8 @@ type LeaseMetrics struct {
 //
 // Obtain a Lease via Leaser.Acquire, not by constructing directly.
 type Lease struct {
-	id       string
+	id       string // caller-supplied identifier, returned by ID()
+	key      string // unique internal key used for bookkeeping and reaping
 	sem      *Semaphore
 	manager  *Leaser
 	released atomic.Bool
@@ -43,11 +44,12 @@ func (l *Lease) Deadline() time.Time { return l.deadline }
 
 // Release explicitly returns the semaphore slot and cancels the reaper timer.
 // Calling Release more than once is safe — subsequent calls are no-ops.
+// The lease's bookkeeping entry is dropped so released leases do not accumulate.
 func (l *Lease) Release() error {
 	if !l.released.CompareAndSwap(false, true) {
 		return ErrLeaseReleased
 	}
-	l.manager.reaper.Remove(l.id)
+	l.manager.forget(l.key)
 	l.sem.Release()
 	l.manager.metrics.Released.Add(1)
 	l.manager.metrics.Active.Add(-1)
@@ -111,18 +113,23 @@ func (lm *Leaser) Acquire(ctx context.Context, id string, p Priority, ttl time.D
 	}
 
 	deadline := time.Now().Add(ttl)
+	// The internal key is unique per lease: using the caller-supplied id as the
+	// map/reaper key let two leases with the same id overwrite each other, which
+	// permanently leaked the semaphore slot of the overwritten lease.
+	key := newULID()
 	lease := &Lease{
 		id:       id,
+		key:      key,
 		sem:      lm.sem,
 		manager:  lm,
 		deadline: deadline,
 	}
 
 	lm.mu.Lock()
-	lm.leases[id] = lease
+	lm.leases[key] = lease
 	lm.mu.Unlock()
 
-	lm.reaper.TouchAt(id, deadline)
+	lm.reaper.TouchAt(key, deadline)
 	lm.metrics.Acquired.Add(1)
 	lm.metrics.Active.Add(1)
 	return lease, nil
@@ -131,13 +138,24 @@ func (lm *Leaser) Acquire(ctx context.Context, id string, p Priority, ttl time.D
 // Metrics returns the manager's operational metrics.
 func (lm *Leaser) Metrics() *LeaseMetrics { return lm.metrics }
 
+// forget drops the bookkeeping entry for key and cancels its reaper timer.
+func (lm *Leaser) forget(key string) {
+	if key == "" {
+		return
+	}
+	lm.mu.Lock()
+	delete(lm.leases, key)
+	lm.mu.Unlock()
+	lm.reaper.Remove(key)
+}
+
 // reclaim is called by the Reaper when a lease's TTL expires.
 // It releases the semaphore slot on the holder's behalf.
-func (lm *Leaser) reclaim(_ context.Context, id string) {
+func (lm *Leaser) reclaim(_ context.Context, key string) {
 	lm.mu.Lock()
-	lease, ok := lm.leases[id]
+	lease, ok := lm.leases[key]
 	if ok {
-		delete(lm.leases, id)
+		delete(lm.leases, key)
 	}
 	lm.mu.Unlock()
 

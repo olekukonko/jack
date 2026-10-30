@@ -3,6 +3,7 @@ package jack
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -124,5 +125,83 @@ func TestLeaseDeadline(t *testing.T) {
 	remaining := time.Until(lease.Deadline())
 	if remaining <= 0 || remaining > ttl {
 		t.Fatalf("unexpected deadline: remaining=%v ttl=%v", remaining, ttl)
+	}
+}
+
+// TestLeaseReleaseDropsBookkeeping guards against the unbounded growth of the
+// internal lease map: a normally released lease must be forgotten.
+func TestLeaseReleaseDropsBookkeeping(t *testing.T) {
+	sem := NewSemaphore(1)
+	defer sem.Close()
+	lm := NewLeaser(sem, LeaserWithTTL(time.Hour))
+	defer lm.Close()
+
+	const cycles = 500
+	for i := 0; i < cycles; i++ {
+		lease, err := lm.Acquire(context.Background(), fmt.Sprintf("lease-%d", i), PriorityHigh, time.Hour)
+		if err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		if err := lease.Release(); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+	}
+
+	lm.mu.Lock()
+	retained := len(lm.leases)
+	lm.mu.Unlock()
+
+	if retained != 0 {
+		t.Fatalf("lease bookkeeping retained %d entries after %d acquire/release cycles", retained, cycles)
+	}
+	if got := sem.Available(); got != 1 {
+		t.Fatalf("expected the slot to be returned, available=%d", got)
+	}
+	if got := lm.Metrics().Active.Load(); got != 0 {
+		t.Fatalf("expected 0 active leases, got %d", got)
+	}
+}
+
+// TestLeaseDuplicateIDsAreIndependent covers leases that share a caller-supplied
+// ID: each must own its slot and its own bookkeeping entry.
+func TestLeaseDuplicateIDsAreIndependent(t *testing.T) {
+	sem := NewSemaphore(2)
+	defer sem.Close()
+	lm := NewLeaser(sem)
+	defer lm.Close()
+
+	l1, err := lm.Acquire(context.Background(), "same-id", PriorityHigh, time.Hour)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	l2, err := lm.Acquire(context.Background(), "same-id", PriorityHigh, time.Hour)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+	if l1 == l2 {
+		t.Fatal("expected two distinct leases")
+	}
+	if got := sem.Available(); got != 0 {
+		t.Fatalf("expected both slots consumed, available=%d", got)
+	}
+
+	if err := l1.Release(); err != nil {
+		t.Fatalf("release first: %v", err)
+	}
+	if got := sem.Available(); got != 1 {
+		t.Fatalf("expected 1 free slot after first release, available=%d", got)
+	}
+	if err := l2.Release(); err != nil {
+		t.Fatalf("release second: %v", err)
+	}
+	if got := sem.Available(); got != 2 {
+		t.Fatalf("expected both slots returned, available=%d", got)
+	}
+
+	lm.mu.Lock()
+	retained := len(lm.leases)
+	lm.mu.Unlock()
+	if retained != 0 {
+		t.Fatalf("expected no retained lease entries, got %d", retained)
 	}
 }
