@@ -17,6 +17,12 @@ type Group struct {
 	sem        chan struct{}   // Limits concurrent workers
 	ctx        context.Context // Group context for cancellation
 	cancel     func()          // Cancels the group context
+
+	// errMu guards errCh against a send racing with the close performed by Wait,
+	// which would otherwise panic with "send on closed channel" when a Group is
+	// reused after Wait.
+	errMu     sync.RWMutex
+	errClosed bool
 }
 
 // NewGroup creates a new Group for running functions concurrently.
@@ -62,6 +68,26 @@ func (g *Group) WithLimit(n int) *Group {
 	return g
 }
 
+// emitError delivers err to the Errors channel unless Wait has already closed
+// it, and cancels the group context on the first error.
+func (g *Group) emitError(err error) {
+	if err == nil {
+		return
+	}
+	g.errMu.RLock()
+	defer g.errMu.RUnlock()
+	if g.errClosed {
+		return
+	}
+	select {
+	case g.errCh <- err:
+	default:
+	}
+	if g.cancel != nil {
+		g.cancelOnce.Do(g.cancel)
+	}
+}
+
 // doWork executes a job with panic recovery and error handling.
 // It sends the first error to the error channel and triggers context cancellation.
 // Thread-safe via channel and once operations.
@@ -73,13 +99,7 @@ func (g *Group) doWork(job func() error) {
 	var errToSend error
 	defer func() {
 		if errToSend != nil {
-			select {
-			case g.errCh <- errToSend:
-			default:
-			}
-			if g.cancel != nil {
-				g.cancelOnce.Do(g.cancel)
-			}
+			g.emitError(errToSend)
 		}
 	}()
 	func() {
@@ -114,6 +134,9 @@ func (g *Group) Go(f func() error) {
 // It requires a context set via WithContext and passes it to the function.
 // The first error, panic, or context cancellation is sent to the Errors channel,
 // and the context is cancelled.
+//
+// The concurrency limit (WithLimit) is applied by doWork exactly once; GoCtx must
+// not acquire it itself, or a limited Group would self-deadlock.
 // Thread-safe via wait group and doWork.
 // Example:
 //
@@ -125,38 +148,14 @@ func (g *Group) GoCtx(f func(context.Context) error) {
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		job := func() error {
+		// Re-check the context after waiting for a slot: a job queued behind the
+		// limit should not call f once the group has been cancelled.
+		g.doWork(func() error {
 			if err := g.ctx.Err(); err != nil {
 				return err
 			}
 			return f(g.ctx)
-		}
-		if g.sem != nil {
-			g.sem <- struct{}{}
-			defer func() { <-g.sem }()
-			if err := g.ctx.Err(); err != nil {
-				select {
-				case g.errCh <- err:
-				default:
-				}
-				if g.cancel != nil {
-					g.cancelOnce.Do(g.cancel)
-				}
-				return
-			}
-		} else {
-			if err := g.ctx.Err(); err != nil {
-				select {
-				case g.errCh <- err:
-				default:
-				}
-				if g.cancel != nil {
-					g.cancelOnce.Do(g.cancel)
-				}
-				return
-			}
-		}
-		g.doWork(job)
+		})
 	}()
 }
 
@@ -172,6 +171,8 @@ func (g *Group) Errors() <-chan error {
 
 // Wait blocks until all Go and GoCtx goroutines complete.
 // It closes the Errors channel and cancels the Group’s context, if set.
+// Errors produced by goroutines started after Wait returns are discarded rather
+// than panicking, but a Group is not meant to be reused after Wait.
 // Thread-safe via wait group and once.
 // Example:
 //
@@ -179,7 +180,10 @@ func (g *Group) Errors() <-chan error {
 func (g *Group) Wait() {
 	g.wg.Wait()
 	g.errOnce.Do(func() {
+		g.errMu.Lock()
+		g.errClosed = true
 		close(g.errCh)
+		g.errMu.Unlock()
 		if g.cancel != nil {
 			g.cancel()
 		}
