@@ -115,7 +115,6 @@ func TestQueueClosedRejectsEnqueue(t *testing.T) {
 
 func TestQueueItemTimeout(t *testing.T) {
 	block := make(chan struct{})
-	var dropped atomic.Uint64
 
 	q := NewQueue(func(_ context.Context, item any) error {
 		<-block
@@ -138,7 +137,6 @@ func TestQueueItemTimeout(t *testing.T) {
 	block <- struct{}{}
 
 	time.Sleep(20 * time.Millisecond)
-	_ = dropped
 	if q.Metrics().Timeouts.Load() == 0 {
 		t.Fatal("expected some items to be timed out")
 	}

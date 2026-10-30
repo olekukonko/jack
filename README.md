@@ -419,6 +419,21 @@ c.Add(event1)
 c.Add(event2) // flushes when batch reaches 100 or timer fires
 ```
 
+### Accumulator — Size/Time/Explicit Batch Flushing
+Batches items and flushes when the buffer reaches `maxSize`, when `maxWait` elapses since the first add, or on explicit `Flush()` — whichever fires first. Omit both options for explicit-only flushing. The flush handler is panic-guarded, and each trigger is counted separately (`SizeFlushes`, `TimerFlushes`, `Flushes`).
+
+```go
+acc := jack.NewAccumulator(func(items []any) error {
+    return batchWrite(items)
+},
+    jack.AccumulatorWithMaxSize(100),
+    jack.AccumulatorWithMaxWait(time.Second),
+)
+defer acc.Close() // flushes whatever is still buffered
+
+acc.Add(item) // flushes at 100 items, 1s after the first add, or on Flush()
+```
+
 ### Observable / Observer
 Type-safe pub/sub with worker pool for async notification delivery. Panic recovery in observers prevents worker crashes.
 
@@ -533,6 +548,7 @@ if cp, ok := err.(*jack.CaughtPanic); ok {
 | Deduplicate concurrent identical requests | `Flight` / `OnceGroup` |
 | Signal/wait between goroutines | `Gate` / `Latch` |
 | Batch items for efficient flushing | `Coalescer` |
+| Batch by size, time, or explicit demand with a panic-safe handler | `Accumulator` |
 | Publish events to multiple observers | `Observable` |
 | Rate-limit rapid calls | `Debouncer` |
 | Background loop with backoff | `Looper` |
