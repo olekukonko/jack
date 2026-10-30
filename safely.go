@@ -30,7 +30,13 @@ func (m *Safely) Do(fn func()) {
 // DoCtx executes fn while holding the mutex lock, with context support.
 // The lock is acquired, then the context is checked. If the context is done,
 // its error is returned and fn is not executed. Otherwise, fn is executed in a goroutine,
-// allowing it to be interrupted if the context is canceled or times out (e.g., via context.WithTimeout).
+// allowing DoCtx to return early if the context is canceled or times out
+// (e.g., via context.WithTimeout).
+//
+// The mutex remains held until fn itself returns, even when DoCtx returns early
+// because the context fired. Releasing it earlier would let a second goroutine
+// enter the critical section while fn is still running.
+//
 // If fn is nil, DoCtx will return a *CaughtPanic.
 // If ctx is nil, DoCtx will panic when ctx.Err() is called.
 // This method does not recover from panics in fn; use SafeCtx for panic recovery.
@@ -45,10 +51,30 @@ func (m *Safely) Do(fn func()) {
 //	})
 //	// err will likely be context.DeadlineExceeded due to timeout
 func (m *Safely) DoCtx(ctx context.Context, fn func() error) error {
+	// Check before locking: a nil ctx must panic here, not with the mutex held.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.Lock()
-	defer m.Unlock()
-	// Delegate to safeCtx without stack capture, as DoCtx doesn't need panic recovery
-	return safeCtx(ctx, fn, false)
+	return m.runLocked(ctx, fn, false)
+}
+
+// runLocked runs fn while the mutex is held and releases the mutex only once fn
+// has actually returned. DoCtx/SafeCtx may return before fn completes; the
+// unlock therefore happens in the goroutine running fn (sync.Mutex is not bound
+// to an owning goroutine), which keeps mutual exclusion intact.
+func (m *Safely) runLocked(ctx context.Context, fn func() error, captureStack bool) error {
+	resultChan := make(chan error, 1)
+	go func() {
+		defer m.Unlock()
+		resultChan <- safe(fn, captureStack)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-resultChan:
+		return err
+	}
 }
 
 // Safe executes fn while holding the mutex lock, with panic recovery.
@@ -71,9 +97,10 @@ func (m *Safely) Safe(fn func() error) error {
 }
 
 // SafeCtx executes fn with panic recovery and context awareness while holding the mutex lock.
-// The lock is acquired, then fn is executed via the standalone SafeCtx function.
-// This ensures fn can be canceled by the context (e.g., via context.WithTimeout),
-// and any panics are recovered. The lock is held until fn completes or the context is canceled.
+// The lock is acquired, then fn is executed via the standalone SafeCtx logic.
+// DoCtx-style early return applies: if the context is canceled or times out, SafeCtx
+// returns that error immediately, but the mutex stays held until fn returns so the
+// critical section is never run concurrently. Any panics are recovered.
 // If fn is nil, SafeCtx will return a *CaughtPanic.
 // If ctx is nil, SafeCtx will panic when ctx.Err() is called.
 // Example:
@@ -87,9 +114,12 @@ func (m *Safely) Safe(fn func() error) error {
 //	})
 //	// err will likely be context.DeadlineExceeded due to timeout
 func (m *Safely) SafeCtx(ctx context.Context, fn func() error) error {
+	// Check before locking: a nil ctx must panic here, not with the mutex held.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.Lock()
-	defer m.Unlock()
-	return SafeCtx(ctx, fn)
+	return m.runLocked(ctx, fn, true)
 }
 
 // safe is the internal implementation with configurable stack collection.

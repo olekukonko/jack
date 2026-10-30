@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -373,5 +374,53 @@ func TestConcurrent(t *testing.T) {
 	wg.Wait()
 	if counter != n {
 		t.Errorf("SafeCtx concurrent: expected counter = %d, got %d", n, counter)
+	}
+}
+
+// TestSafelyDoCtxKeepsLockUntilFnReturns verifies mutual exclusion is not broken
+// when DoCtx returns early because the context expired.
+func TestSafelyDoCtxKeepsLockUntilFnReturns(t *testing.T) {
+	var mu Safely
+	var inCritical atomic.Bool
+	var overlap atomic.Bool
+
+	fnStarted := make(chan struct{})
+	fnFinished := make(chan struct{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- mu.DoCtx(ctx, func() error {
+			inCritical.Store(true)
+			close(fnStarted)
+			time.Sleep(100 * time.Millisecond)
+			inCritical.Store(false)
+			close(fnFinished)
+			return nil
+		})
+	}()
+
+	<-fnStarted
+	if err := <-errc; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded from the early return, got %v", err)
+	}
+
+	// The first critical section is still running; a second caller must block.
+	secondRan := make(chan struct{})
+	go func() {
+		mu.Do(func() {
+			if inCritical.Load() {
+				overlap.Store(true)
+			}
+			close(secondRan)
+		})
+	}()
+
+	<-fnFinished
+	<-secondRan
+	if overlap.Load() {
+		t.Fatal("mutual exclusion violated: second critical section ran while the first was still executing")
 	}
 }
