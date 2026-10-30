@@ -566,3 +566,66 @@ func TestFuture_ZeroTimeout(t *testing.T) {
 		t.Errorf("Expected zero value, got %v", result)
 	}
 }
+
+// TestFutureCancelPropagatesCancellation verifies Cancel actually interrupts fn
+// through the derived context, not just discards the result.
+func TestFutureCancelPropagatesCancellation(t *testing.T) {
+	started := make(chan struct{})
+	ctxDone := make(chan struct{})
+
+	f := NewFuture(context.Background(), func(ctx context.Context) (int, error) {
+		close(started)
+		<-ctx.Done() // only returns if Cancel cancels the derived context
+		close(ctxDone)
+		return 0, ctx.Err()
+	})
+
+	<-started
+	if !f.Cancel() {
+		t.Fatal("expected Cancel to report true on first call")
+	}
+
+	select {
+	case <-ctxDone:
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not cancel the context passed to fn")
+	}
+
+	if _, err := f.Await(); !errors.Is(err, ErrFutureCanceled) {
+		t.Fatalf("expected ErrFutureCanceled, got %v", err)
+	}
+	if f.Cancel() {
+		t.Fatal("expected second Cancel to report false")
+	}
+	if !f.IsCanceled() || !f.IsDone() {
+		t.Fatalf("expected canceled=%v done=%v", f.IsCanceled(), f.IsDone())
+	}
+}
+
+// TestFutureNilContext ensures a nil context no longer panics inside execute.
+func TestFutureNilContext(t *testing.T) {
+	f := NewFuture[int](nil, func(context.Context) (int, error) { return 7, nil })
+	got, err := f.Await()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != 7 {
+		t.Fatalf("expected 7, got %d", got)
+	}
+}
+
+// TestFutureParentCancelStillReportsContextCanceled locks in the pre-existing
+// behaviour: cancelling the parent context yields context.Canceled, while an
+// explicit Future.Cancel yields ErrFutureCanceled.
+func TestFutureParentCancelStillReportsContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := NewFuture(ctx, func(ctx context.Context) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+
+	cancel()
+	if _, err := f.Await(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled for parent cancellation, got %v", err)
+	}
+}

@@ -2,6 +2,7 @@ package jack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime/debug"
@@ -14,13 +15,6 @@ var (
 	ErrFutureCanceled = fmt.Errorf("future was canceled")
 	ErrFutureTimeout  = fmt.Errorf("future timed out")
 )
-
-var resultPool = sync.Pool{
-	New: func() interface{} {
-		ch := make(chan futureResult, 1)
-		return &ch
-	},
-}
 
 type futureResult struct {
 	val interface{}
@@ -38,11 +32,17 @@ type Future[T any] struct {
 	mu       sync.Mutex
 	fn       func(context.Context) (T, error)
 	ctx      context.Context
+
+	// cancel cancels the future's derived context so Cancel can actually
+	// interrupt fn instead of merely discarding its result.
+	cancel       context.CancelFunc
+	userCanceled atomic.Bool
 }
 
 // NewFuture creates a Future that executes fn asynchronously in a new goroutine.
-// The context governs cancellation; fn receives it directly. If fn is nil,
-// the Future is returned in an already-failed state.
+// The context governs cancellation; fn receives a child context that is
+// cancelled by Future.Cancel. A nil ctx is treated as context.Background().
+// If fn is nil, the Future is returned in an already-failed state.
 func NewFuture[T any](ctx context.Context, fn func(context.Context) (T, error)) *Future[T] {
 	if fn == nil {
 		f := &Future[T]{done: make(chan struct{})}
@@ -53,10 +53,16 @@ func NewFuture[T any](ctx context.Context, fn func(context.Context) (T, error)) 
 		return f
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+
 	f := &Future[T]{
-		done: make(chan struct{}),
-		fn:   fn,
-		ctx:  ctx,
+		done:   make(chan struct{}),
+		fn:     fn,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	f.wg.Add(1)
@@ -79,6 +85,9 @@ func (f *Future[T]) execute() {
 	defer func() {
 		if f.closed.CompareAndSwap(false, true) {
 			close(f.done)
+		}
+		if f.cancel != nil {
+			f.cancel() // release the derived context
 		}
 	}()
 
@@ -118,9 +127,19 @@ func (f *Future[T]) execute() {
 	}
 }
 
-// Cancel signals the Future to stop. Returns true if this call caused the cancellation.
+// Cancel stops the Future: it cancels the future's context so fn can observe
+// cancellation, and marks the result as discarded so Await returns
+// ErrFutureCanceled. Returns true if this call caused the cancellation.
+// A panicking or blocking fn is still awaited; goroutines cannot be killed.
 func (f *Future[T]) Cancel() bool {
-	return f.canceled.CompareAndSwap(false, true)
+	if !f.userCanceled.CompareAndSwap(false, true) {
+		return false
+	}
+	f.canceled.Store(true)
+	if f.cancel != nil {
+		f.cancel()
+	}
+	return true
 }
 
 // IsCanceled reports whether the Future was cancelled before completing.
@@ -144,6 +163,11 @@ func (f *Future[T]) Await() (T, error) {
 	f.wg.Wait()
 	var zero T
 	if f.err != nil {
+		// An explicit Cancel maps the resulting context.Canceled back to
+		// ErrFutureCanceled so existing callers keep seeing the same sentinel.
+		if f.userCanceled.Load() && errors.Is(f.err, context.Canceled) {
+			return zero, ErrFutureCanceled
+		}
 		return zero, f.err
 	}
 	if f.IsCanceled() {
