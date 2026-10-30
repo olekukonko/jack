@@ -1,6 +1,7 @@
 package jack
 
 import (
+	"math/rand/v2"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -8,12 +9,13 @@ import (
 
 const plocalShards = 128
 
-var plocalRoundRobin atomic.Uint64
-
-// plocalIndexFast returns a round-robin shard index for counters.
-// Zero-allocation, zero-contention distribution across shards.
+// plocalIndexFast returns a shard index for counters.
+// Zero-allocation and contention-free: math/rand/v2's top-level source is
+// per-P, so no shared cache line is touched (an earlier implementation used a
+// single global atomic counter, which is precisely the contention this type
+// exists to avoid and measured ~2x slower than one plain atomic.Int64).
 func plocalIndexFast() uint {
-	return uint(plocalRoundRobin.Add(1) % uint64(plocalShards))
+	return uint(rand.Uint32()) % plocalShards
 }
 
 // getGoroutineID extracts the goroutine ID from the runtime stack trace.
@@ -56,6 +58,11 @@ func (c *PLocalCounter) Value() int64 {
 
 // PLocal provides goroutine-sharded storage to reduce lock contention.
 // Each goroutine accesses an independent shard with stable affinity.
+//
+// Shard affinity is derived by parsing the current goroutine ID from
+// runtime.Stack, which costs a few microseconds per call. Use it for
+// low-frequency, large-payload state (buffers, batches, caches), not as a
+// drop-in for hot counters — PLocalCounter is the cheap option for those.
 type PLocal[T any] struct {
 	shards [plocalShards]plocalShard[T]
 }
