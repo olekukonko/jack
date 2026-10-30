@@ -2,6 +2,7 @@ package jack
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -261,5 +262,44 @@ func TestQueueConcurrentStress(t *testing.T) {
 
 	if processed.Load() < producers*itemsEach {
 		t.Fatalf("expected %d processed, got %d", producers*itemsEach, processed.Load())
+	}
+}
+
+// TestQueueRejectedEnqueueNotCountedAsDropped verifies that a full queue counts
+// as Saturated only: the caller keeps ownership of the item, so nothing is
+// dropped.
+func TestQueueRejectedEnqueueNotCountedAsDropped(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+
+	q := NewQueue(func(context.Context, any) error {
+		once.Do(func() { close(started) })
+		<-release
+		return nil
+	}, QueueWithWorkers(1), QueueWithCapacity(1))
+	defer func() {
+		close(release)
+		q.Close()
+	}()
+
+	if err := q.Enqueue(PriorityHigh, "running"); err != nil {
+		t.Fatalf("enqueue running: %v", err)
+	}
+	<-started // worker is busy, so one more item fits in the buffer
+
+	if err := q.Enqueue(PriorityHigh, "buffered"); err != nil {
+		t.Fatalf("enqueue buffered: %v", err)
+	}
+	if err := q.Enqueue(PriorityHigh, "rejected"); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("expected ErrQueueFull, got %v", err)
+	}
+
+	m := q.Metrics()
+	if got := m.Saturated.Load(); got != 1 {
+		t.Fatalf("expected Saturated=1, got %d", got)
+	}
+	if got := m.Dropped.Load(); got != 0 {
+		t.Fatalf("rejected enqueue must not be counted as dropped, got %d", got)
 	}
 }

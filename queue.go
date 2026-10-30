@@ -11,7 +11,7 @@ import (
 type QueueMetrics struct {
 	Enqueued  atomic.Uint64
 	Dequeued  atomic.Uint64
-	Dropped   atomic.Uint64
+	Dropped   atomic.Uint64 // items discarded after being dequeued (item timeout)
 	Timeouts  atomic.Uint64
 	Depth     atomic.Int64
 	MaxDepth  atomic.Int64
@@ -115,7 +115,8 @@ func (q *Queue) Enqueue(p Priority, item any) error {
 	if len(q.bins[int(p)]) >= q.capacity {
 		q.mu.Unlock()
 		q.metrics.Saturated.Add(1)
-		q.metrics.Dropped.Add(1)
+		// The item was rejected while still owned by the caller, so it is not a
+		// drop; only timeouts (items discarded after dequeue) count as drops.
 		return ErrQueueFull
 	}
 	q.bins[int(p)] = append(q.bins[int(p)], queueItem{
@@ -138,6 +139,10 @@ func (q *Queue) Enqueue(p Priority, item any) error {
 // EnqueueCtx adds an item at the given priority, blocking until space is available,
 // the context is cancelled, or the queue is closed.
 func (q *Queue) EnqueueCtx(ctx context.Context, p Priority, item any) error {
+	// Reuse a single timer instead of allocating a new one per retry iteration.
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+
 	for {
 		err := q.Enqueue(p, item)
 		if err == nil || err == ErrQueueClosed {
@@ -148,7 +153,8 @@ func (q *Queue) EnqueueCtx(ctx context.Context, p Priority, item any) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-q.notifyCh:
-		case <-time.After(time.Millisecond):
+		case <-timer.C:
+			timer.Reset(time.Millisecond)
 		}
 		if q.closed.Load() {
 			return ErrQueueClosed
