@@ -382,6 +382,20 @@ user, err, shared := g.Do(ctx, "user-123", func() (*User, error) {
 })
 ```
 
+### HashRing — Consistent Hashing
+Shard keys across nodes with virtual nodes and minimal rebalancing: adding or removing a node only moves the keys that node owns, instead of remapping the entire keyspace like a modulo hash. Lookups (`Get`/`GetN`) are lock-free — membership changes publish a new immutable snapshot atomically — so it is safe to update the ring while requests are being routed.
+
+```go
+ring := jack.NewHashRing(jack.RingWithReplicas(160))
+ring.Add("cache-a", "cache-b", "cache-c")
+
+node, ok := ring.Get("user:42")      // primary owner
+replicas := ring.GetN("user:42", 2)  // primary + next node clockwise
+
+ring.Add("cache-d")   // only ~1/4 of keys move, and only onto cache-d
+ring.Remove("cache-a")
+```
+
 ### Gate — Reusable Barrier
 Open lets all current and future waiters pass. Close blocks future waiters. Pulse wakes current waiters but remains closed.
 
@@ -545,6 +559,7 @@ if cp, ok := err.(*jack.CaughtPanic); ok {
 | Track and terminate all goroutines | `Routines` |
 | Bound concurrent access with priorities | `Semaphore` |
 | Eliminate cache-line contention on counters | `PLocal` / `PLocalCounter` |
+| Distribute keys across nodes with minimal rebalancing | `HashRing` |
 | Deduplicate concurrent identical requests | `Flight` / `OnceGroup` |
 | Signal/wait between goroutines | `Gate` / `Latch` |
 | Batch items for efficient flushing | `Coalescer` |
