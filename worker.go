@@ -68,9 +68,6 @@ func (w *worker) start() {
 			}
 
 			taskID := job.ID()
-			if taskID == "" {
-				taskID = "unknown-task." + newULID()
-			}
 
 			originalCtx := job.Context()
 			if w.observable != nil {

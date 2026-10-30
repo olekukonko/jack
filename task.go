@@ -3,6 +3,7 @@ package jack
 import (
 	"context"
 	"errors"
+	"sync"
 )
 
 // tasker wraps a Task or TaskCtx with a context and ID generation logic.
@@ -13,6 +14,13 @@ type tasker struct {
 	taskIDGenerator func(interface{}) string
 	defaultIDPrefix string
 	noID            bool // when true, skip ID generation entirely
+
+	// idOnce caches the generated ID. ID() is called by both the submitter
+	// (for the "queued" event) and the worker (for "run"/"done"); regenerating
+	// produced a different ULID each call, so events for one task could not be
+	// correlated and every task paid for two ULIDs.
+	idOnce sync.Once
+	id     string
 }
 
 // Context returns the task's associated context.
@@ -23,10 +31,17 @@ func (tj *tasker) Context() context.Context {
 	return tj.ctx
 }
 
-// ID generates a unique identifier for the task.
+// ID returns a stable identifier for the task, generating it on first use.
 // Priority: taskIDGenerator → Identifiable.ID → ULID (globally unique).
 // When noID is true, returns "" immediately with zero allocation.
+// The value is cached so every caller (submitter and worker) observes the same ID.
 func (tj *tasker) ID() string {
+	tj.idOnce.Do(func() { tj.id = tj.generateID() })
+	return tj.id
+}
+
+// generateID produces the identifier on first use; see ID.
+func (tj *tasker) generateID() string {
 	if tj.noID {
 		return ""
 	}
